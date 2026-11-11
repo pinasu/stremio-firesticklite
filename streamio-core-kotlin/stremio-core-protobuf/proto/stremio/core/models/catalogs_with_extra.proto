@@ -1,0 +1,46 @@
+syntax = "proto2";
+
+package stremio.core.models;
+
+option java_package = "com.stremio.core.models";
+
+import "stremio/core/models/loadable.proto";
+import "stremio/core/types/addon.proto";
+import "stremio/core/types/meta_item_preview.proto";
+
+message CatalogsWithExtra {
+  optional Selected selected = 1;
+  repeated Catalog catalogs = 2;
+
+  message Selected {
+    optional string type = 1;
+    repeated stremio.core.types.ExtraValue extra = 2;
+  }
+}
+
+message Catalog {
+  repeated LoadablePage pages = 2;
+}
+
+message LoadablePage {
+  required string title = 1;
+  optional string addon_id = 2;
+  optional string catalog_id = 3;
+  optional string catalog_name = 4;
+  optional string catalog_type = 5;
+  required stremio.core.types.ResourceRequest request = 6;
+  oneof content {
+    Loading loading = 7;
+    Error error = 8;
+    Page ready = 9;
+  }
+  required DiscoverDeepLinks deep_links = 10;
+}
+
+message Page {
+  repeated stremio.core.types.MetaItemPreview meta_items = 1;
+}
+
+message DiscoverDeepLinks {
+  required string discover = 1;
+}

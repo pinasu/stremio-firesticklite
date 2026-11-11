@@ -1,0 +1,88 @@
+syntax = "proto2";
+
+package stremio.core.models;
+
+option java_package = "com.stremio.core.models";
+
+import "stremio/core/models/loadable.proto";
+import "stremio/core/models/meta_details.proto";
+import "stremio/core/types/addon.proto";
+import "stremio/core/types/library.proto";
+import "stremio/core/types/subtitle.proto";
+import "stremio/core/types/stream.proto";
+import "stremio/core/types/video.proto";
+
+message Player {
+  optional Selected selected = 1;
+  optional VideoParams video_params = 2;
+  optional LoadableMetaItem meta_item = 3;
+  repeated LoadableSubtitles subtitles = 4;
+  optional stremio.core.types.Video next_video = 5;
+  optional stremio.core.types.Video.SeriesInfo series_info = 6;
+  optional stremio.core.types.LibraryItem library_item = 7;
+  optional StreamState stream_state = 8;
+  optional IntroOutro intro_outro = 9;
+  optional LoadableConvertedStream stream = 10;
+
+  message VideoParams {
+    optional string hash = 1;
+    optional uint64 size = 2;
+    optional string filename = 3;
+  }
+  message StreamState {
+    optional SubtitleTrack subtitle_track = 1;
+    optional int64 subtitle_delay = 2;
+    optional float subtitle_size = 3;
+    optional float subtitle_offset = 4;
+    optional AudioTrack audio_track = 5;
+    optional int64 audio_delay = 6;
+    optional float playback_speed = 7;
+    optional string player_type = 8;
+  }
+  message SubtitleTrack {
+    required string id = 1;
+    required bool embedded = 2;
+    optional string language = 3;
+  }
+  message AudioTrack {
+    required string id = 1;
+    optional string language = 2;
+  }
+  message Selected {
+    required stremio.core.types.Stream stream = 1;
+    optional stremio.core.types.ResourceRequest stream_request = 2;
+    optional stremio.core.types.ResourceRequest meta_request = 3;
+    optional stremio.core.types.ResourcePath subtitles_path = 4;
+  }
+  message IntroOutro {
+    optional IntroData intro = 1;
+    optional uint64 outro = 2;
+  }
+  message IntroData {
+    required uint64 from = 1;
+    required uint64 to = 2;
+    optional uint64 duration = 3;
+  }
+}
+
+message LoadableConvertedStream {
+  oneof content {
+    Loading loading = 3;
+    Error error = 4;
+    stremio.core.types.Stream ready = 5;
+  }
+}
+
+message LoadableSubtitles {
+  required string title = 1;
+  required stremio.core.types.ResourceRequest request = 2;
+  oneof content {
+    Loading loading = 3;
+    Error error = 4;
+    Subtitles ready = 5;
+  }
+}
+
+message Subtitles {
+  repeated stremio.core.types.Subtitle subtitles = 1;
+}

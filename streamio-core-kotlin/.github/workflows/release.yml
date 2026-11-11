@@ -1,0 +1,63 @@
+name: Release stremio-core-kotlin
+
+on:
+  release:
+    types: [published]
+
+env:
+  # Make sure to keep this version in line with `.config/cargo.toml` file for
+  # stremio-core-kotlin!
+  NDK_VERSION: '29.0.14206865'
+  RUST_VERSION: '1.77'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: "adopt"
+      - name: Setup Android SDK
+        # newer version of the 2 actions will cause a LinkageError
+        # Error: LinkageError occurred while loading main class com.android.sdklib.tool.sdkmanager.SdkManagerCli
+        # java.lang.UnsupportedClassVersionError: com/android/sdklib/tool/sdkmanager/SdkManagerCli
+        # has been compiled by a more recent version of the Java Runtime (class file version 61.0),
+        # this version of the Java Runtime only recognizes class file versions up to 55.0
+        # uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v2
+      - name: Setup Android NDK (${{ env.NDK_VERSION }})
+        run: yes | sdkmanager "ndk;${{ env.NDK_VERSION }}" >/dev/null
+
+      # use MSRV
+      - name: Set Rust version to MSRV (${{ env.RUST_VERSION }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          # Add armv7, aarch64, i686, x86_64 targets
+          targets: armv7-linux-androideabi, aarch64-linux-android, i686-linux-android, x86_64-linux-android
+          components: rust-std
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build aar
+        working-directory: stremio-core-kotlin
+        run: ./gradlew -Pversion=${GITHUB_REF##*/} publishToMavenLocal
+      - name: Archive artifacts
+        working-directory: stremio-core-kotlin
+        run: tar -C ~/.m2/repository/com/github/Stremio -cvzf stremio-core-kotlin.tar.gz .
+      - name: Archive build
+        working-directory: stremio-core-kotlin
+        run: tar -C build -cvzf build.tar.gz publications
+      - name: Upload build artifacts
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: "stremio-core-kotlin/*.tar.gz"
+          tag: ${{ github.ref }}
+          overwrite: true
+          file_glob: true

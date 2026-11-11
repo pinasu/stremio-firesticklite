@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Leanback / Fire TV launcher banner: 160x90dp (320x180px on xhdpi TVs). -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <size
+                android:width="160dp"
+                android:height="90dp" />
+            <gradient
+                android:angle="0"
+                android:endColor="#2A1F5C"
+                android:startColor="#100F1F"
+                android:type="linear" />
+        </shape>
+    </item>
+    <item
+        android:width="108dp"
+        android:height="108dp"
+        android:drawable="@drawable/ic_launcher_foreground"
+        android:gravity="center" />
+</layer-list>

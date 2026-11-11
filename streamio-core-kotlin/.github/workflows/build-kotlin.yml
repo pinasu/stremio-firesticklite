@@ -1,0 +1,55 @@
+name: Build (stremio-core-kotlin)
+
+on:
+  push:
+    branches:
+      - '**'
+
+# Stops the running workflow of previous pushes
+concurrency:
+  group: ${{ github.ref }}-android
+  cancel-in-progress: true
+
+env:
+  # For the confusing protoc versioning check out these docs:
+  # https://protobuf.dev/support/version-support/
+  # v3.26.x, where `.x` is a wildcard
+  #
+  # For stremio-core-android we use version 3.21
+  # Check build.gradle.kts
+  PROTOC_VERSION: '21.x'
+  RUST_VERSION: '1.77'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # add protoc because of stremio-core-csharp
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "${{ env.PROTOC_VERSION }}"
+
+      - name: Rust setup (${{ env.RUST_VERSION }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build code
+        run: cargo build -p stremio-core-kotlin
+
+      - name: Lint code format
+        run: cargo fmt --all -- --check
+
+      - name: Lint code
+        run: cargo clippy --all -- -D warnings
+
+      - name: Test code
+        run: cargo test

@@ -1,0 +1,37 @@
+# Built artifacts
+build/
+/*/build/
+
+# Gradle files
+.gradle/
+
+# Local configuration
+local.properties
+
+# Android Studio / IntelliJ IDEA configuration files
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Kotlin compiler cache
+.kotlin/
+
+# Log files
+*.log
+
+# Generated JNI libraries (built dynamically by cargo/gradle tasks)
+**/jniLibs/
+
+# The app intentionally excludes libc++ from vendored MPV and packages one
+# shared C++ runtime per ABI from the main app module.
+!app/src/main/jniLibs/
+!app/src/main/jniLibs/*/
+app/src/main/jniLibs/*/*
+!app/src/main/jniLibs/*/libc++_shared.so
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini

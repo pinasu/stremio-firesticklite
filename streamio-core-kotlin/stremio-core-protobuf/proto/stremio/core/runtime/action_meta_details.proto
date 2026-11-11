@@ -1,0 +1,31 @@
+syntax = "proto2";
+
+package stremio.core.runtime;
+
+option java_package = "com.stremio.core.runtime.msg";
+
+import "stremio/core/types/video.proto";
+import "stremio/core/types/rating.proto";
+
+message ActionMetaDetails {
+  oneof args {
+    bool mark_as_watched = 1;
+    VideoState mark_video_as_watched = 2;
+    MarkSeasonAsWatchedArgs mark_season_as_watched = 3;
+    RateArgs rate = 4;
+  }
+
+  message VideoState {
+    required stremio.core.types.Video video = 1;
+    required bool is_watched = 2;
+  }
+
+  message MarkSeasonAsWatchedArgs {
+    required uint32 season = 1;
+    required bool watched = 2;
+  }
+
+  message RateArgs {
+    optional stremio.core.types.Rating status = 1;
+  }
+}

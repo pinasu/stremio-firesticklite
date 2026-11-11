@@ -1,0 +1,10 @@
+**/build
+**/target
+**/.gradle
+**/src/debug
+**/src/release
+/.idea/
+/local.properties
+
+/stremio-core-protobuf/src/protobuf/*
+!/stremio-core-protobuf/src/protobuf/README.md

@@ -1,0 +1,273 @@
+name: Fire TV APK
+
+# Builds a ready-to-sideload APK for Amazon Fire TV (Fire TV Stick Lite = armeabi-v7a) with the
+# native Rust streaming server included. Run it from the "Actions" tab ("Run workflow").
+#
+# Signing: if the ANDROID_RELEASE_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS /
+# ANDROID_KEY_PASSWORD secrets exist they are used (recommended: updates install over the previous
+# version). Otherwise a temporary key is generated for this run only: the APK installs fine, but a
+# later build signed with another temporary key must be installed after uninstalling the old one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: Version name (optional)
+        required: false
+      publish_release:
+        description: Publish the APKs as a GitHub Release (used by the in-app updater)
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "firetv-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-stream-server:
+    name: Build Stream Server ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Fire TV Stick Lite / Fire TV Stick (2nd/3rd gen) / most Fire OS devices.
+          - abi: armeabi-v7a
+            rust-target: armv7-linux-androideabi
+            vcpkg-triplet: arm-android
+            vcpkg-arch: arm
+            android-abi: armeabi-v7a
+            make-host: armv7a-linux-androideabi
+          # 64-bit Android TV boxes (e.g. Chromecast with Google TV, Fire TV Stick 4K Max).
+          - abi: arm64-v8a
+            rust-target: aarch64-linux-android
+            vcpkg-triplet: arm64-android
+            vcpkg-arch: arm64
+            android-abi: arm64-v8a
+            make-host: aarch64-linux-android
+
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      - name: Checkout stream-server
+        uses: actions/checkout@v4
+        with:
+          repository: perpetus/stream-server
+          ref: 368666eb09f9c4849a7df7f2a6a8b26171f24cfb
+          path: stream-server
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Export GitHub Actions cache env for vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL);
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed-${{ matrix.abi }}
+          key: android-vcpkg-${{ matrix.vcpkg-triplet }}-${{ hashFiles('stream-server/vcpkg.json') }}
+          restore-keys: |
+            android-vcpkg-${{ matrix.vcpkg-triplet }}-
+
+      - name: Create Android triplets
+        run: |
+          mkdir -p stream-server/triplets
+          cat > stream-server/triplets/${{ matrix.vcpkg-triplet }}.cmake << 'EOF'
+          set(VCPKG_TARGET_ARCHITECTURE ${{ matrix.vcpkg-arch }})
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_LIBRARY_LINKAGE static)
+          set(VCPKG_CMAKE_SYSTEM_NAME Android)
+          set(VCPKG_CMAKE_SYSTEM_VERSION 24)
+          set(VCPKG_MAKE_BUILD_TRIPLET "--host=${{ matrix.make-host }}")
+          EOF
+
+          if [[ "${{ matrix.android-abi }}" == "armeabi-v7a" ]]; then
+            echo 'set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DANDROID_ABI=armeabi-v7a -DANDROID_ARM_NEON=ON)' >> stream-server/triplets/${{ matrix.vcpkg-triplet }}.cmake
+          else
+            echo 'set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DANDROID_ABI=${{ matrix.android-abi }})' >> stream-server/triplets/${{ matrix.vcpkg-triplet }}.cmake
+          fi
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '84bab45d415d22042bd0b9081aea57f362da3f35'
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgJsonGlob: 'stream-server/vcpkg.json'
+          runVcpkgInstall: false
+
+      - name: Install vcpkg dependencies
+        working-directory: stream-server
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet ${{ matrix.vcpkg-triplet }} \
+            --x-install-root=${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }} \
+            --overlay-triplets=triplets \
+            --overlay-ports=vcpkg-overlays
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+
+      - name: Build ${{ matrix.abi }}
+        working-directory: stream-server/server
+        run: cargo ndk --target ${{ matrix.rust-target }} --platform 24 build --release --features libtorrent --no-default-features
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }}
+          VCPKGRS_TRIPLET: ${{ matrix.vcpkg-triplet }}
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }}/${{ matrix.vcpkg-triplet }}/lib/pkgconfig
+          PKG_CONFIG_SYSROOT_DIR: ${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }}/${{ matrix.vcpkg-triplet }}
+          OPENSSL_DIR: ${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }}/${{ matrix.vcpkg-triplet }}
+
+      - name: Prepare JNI libs
+        run: |
+          mkdir -p jniLibs/${{ matrix.abi }}
+          cp stream-server/target/${{ matrix.rust-target }}/release/libstream_server.so jniLibs/${{ matrix.abi }}/
+
+      - name: Upload JNI libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: firetv-stream-server-jniLibs-${{ matrix.abi }}
+          path: jniLibs/
+
+  apk:
+    name: Build Fire TV APK
+    runs-on: ubuntu-latest
+    needs: build-stream-server
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download stream-server JNI libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firetv-stream-server-jniLibs-*
+          path: app/src/main/jniLibs/
+          merge-multiple: true
+
+      - name: Verify JNI libs
+        run: |
+          for abi in armeabi-v7a arm64-v8a; do
+            test -f "app/src/main/jniLibs/${abi}/libstream_server.so"
+            ls -la "app/src/main/jniLibs/${abi}/"
+          done
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle executable
+        run: chmod +x ./gradlew
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version_name="${GITHUB_REF_NAME#firetv-v}"
+          else
+            version_name="${{ inputs.version_name }}"
+            if [[ -z "${version_name}" ]]; then
+              version_name="0.1.${GITHUB_RUN_NUMBER}"
+            fi
+          fi
+          echo "VERSION_NAME=${version_name}" >> "${GITHUB_ENV}"
+          echo "VERSION_CODE=${GITHUB_RUN_NUMBER}" >> "${GITHUB_ENV}"
+          echo "RELEASE_TAG=firetv-v${version_name}" >> "${GITHUB_ENV}"
+
+      - name: Prepare signing key
+        shell: bash
+        env:
+          SECRET_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          SECRET_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SECRET_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          keystore_file="${RUNNER_TEMP}/release.keystore"
+          if [[ -n "${SECRET_KEYSTORE_BASE64}" && -n "${SECRET_KEYSTORE_PASSWORD}" && -n "${SECRET_KEY_ALIAS}" && -n "${SECRET_KEY_PASSWORD}" ]]; then
+            printf '%s' "${SECRET_KEYSTORE_BASE64}" | base64 --decode > "${keystore_file}"
+            echo "Using the signing key from repository secrets."
+            echo "ANDROID_KEYSTORE_PASSWORD=${SECRET_KEYSTORE_PASSWORD}" >> "${GITHUB_ENV}"
+            echo "ANDROID_KEY_ALIAS=${SECRET_KEY_ALIAS}" >> "${GITHUB_ENV}"
+            echo "ANDROID_KEY_PASSWORD=${SECRET_KEY_PASSWORD}" >> "${GITHUB_ENV}"
+          else
+            echo "::warning::No signing secrets configured: signing with a temporary key generated for this run."
+            keytool -genkeypair -noprompt \
+              -keystore "${keystore_file}" -storetype PKCS12 \
+              -alias firetv -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass firetvtemp -keypass firetvtemp \
+              -dname "CN=Stremio Fire TV (temporary key)"
+            echo "ANDROID_KEYSTORE_PASSWORD=firetvtemp" >> "${GITHUB_ENV}"
+            echo "ANDROID_KEY_ALIAS=firetv" >> "${GITHUB_ENV}"
+            echo "ANDROID_KEY_PASSWORD=firetvtemp" >> "${GITHUB_ENV}"
+          fi
+          echo "ANDROID_KEYSTORE_FILE=${keystore_file}" >> "${GITHUB_ENV}"
+
+      - name: Build release APK
+        run: >
+          ./gradlew
+          :mpv-android-lib:assembleRelease
+          :app:assembleRelease
+          --warning-mode all
+          -PVERSION_CODE=${VERSION_CODE}
+          -PVERSION_NAME=${VERSION_NAME}
+          -PUPDATE_REPOSITORY=${{ github.repository }}
+
+      - name: Collect APKs
+        shell: bash
+        run: |
+          rm -rf dist
+          python .github/scripts/collect-apks.py \
+            --metadata app/build/outputs/apk/release/output-metadata.json \
+            --apk-dir app/build/outputs/apk/release \
+            --output-dir dist \
+            --version-name "${VERSION_NAME}" \
+            --build-type release
+          ls -la dist
+          test -f "dist/StremioMobile-v${VERSION_NAME}-armeabi-v7a-release.apk"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stremio-firetv-${{ env.VERSION_NAME }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'push' || inputs.publish_release }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --title "Stremio Fire TV ${VERSION_NAME}" \
+              --notes "Fire TV / Android TV build ${VERSION_NAME}. Fire TV Stick Lite: use the armeabi-v7a APK."
+          fi
+          gh release upload "${RELEASE_TAG}" dist/* --clobber

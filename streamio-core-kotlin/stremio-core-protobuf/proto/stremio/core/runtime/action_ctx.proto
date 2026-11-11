@@ -1,0 +1,57 @@
+syntax = "proto2";
+
+package stremio.core.runtime;
+
+option java_package = "com.stremio.core.runtime.msg";
+
+import "google/protobuf/empty.proto";
+import "stremio/core/types/auth_request.proto";
+import "stremio/core/types/manifest.proto";
+import "stremio/core/types/meta_item_preview.proto";
+import "stremio/core/types/profile.proto";
+
+message ActionCtx {
+  oneof args {
+    stremio.core.types.AuthRequest authenticate = 1;
+    google.protobuf.Empty logout = 2;
+    string delete_account = 3;
+    stremio.core.types.AddonDescriptor install_addon = 4;
+    google.protobuf.Empty install_trakt_addon = 5;
+    google.protobuf.Empty logout_trakt = 6;
+    stremio.core.types.AddonDescriptor upgrade_addon = 7;
+    stremio.core.types.AddonDescriptor uninstall_addon = 8;
+    stremio.core.types.Profile.Settings update_settings = 9;
+    stremio.core.types.MetaItemPreview add_to_library = 10;
+    string remove_from_library = 11;
+    string rewind_library_item = 12;
+    LibraryItemMarkAsWatched library_item_mark_as_watched = 13;
+    LibraryItemToggle toggle_library_item_notifications = 14;
+    string dismiss_notification_item = 15;
+    google.protobuf.Empty push_user_to_api = 16;
+    PullUserFromApi pull_user_from_api = 17;
+    google.protobuf.Empty push_addons_to_api = 18;
+    google.protobuf.Empty pull_addons_from_api = 19;
+    google.protobuf.Empty sync_library_with_api = 20;
+    google.protobuf.Empty pull_notifications = 21;
+    google.protobuf.Empty get_events = 22;
+    string dismiss_event = 23;
+    // Add a server URL to the list of available streaming servers
+    string add_server_url = 24;
+    // Delete a server URL from the list of available streaming servers
+    string delete_server_url = 25;
+  }
+
+  message PullUserFromApi {
+    optional string token = 1;
+  }
+
+  message LibraryItemToggle {
+    required string id = 1;
+    required bool toggle = 2;
+  }
+
+  message LibraryItemMarkAsWatched {
+    required string id = 1;
+    required bool is_watched = 2;
+  }
+}

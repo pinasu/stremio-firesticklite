@@ -1,0 +1,2065 @@
+diff --git a/.github/workflows/firetv-apk.yml b/.github/workflows/firetv-apk.yml
+new file mode 100644
+index 0000000..4d72e70
+--- /dev/null
++++ b/.github/workflows/firetv-apk.yml
+@@ -0,0 +1,273 @@
++name: Fire TV APK
++
++# Builds a ready-to-sideload APK for Amazon Fire TV (Fire TV Stick Lite = armeabi-v7a) with the
++# native Rust streaming server included. Run it from the "Actions" tab ("Run workflow").
++#
++# Signing: if the ANDROID_RELEASE_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS /
++# ANDROID_KEY_PASSWORD secrets exist they are used (recommended: updates install over the previous
++# version). Otherwise a temporary key is generated for this run only: the APK installs fine, but a
++# later build signed with another temporary key must be installed after uninstalling the old one.
++
++on:
++  workflow_dispatch:
++    inputs:
++      version_name:
++        description: Version name (optional)
++        required: false
++      publish_release:
++        description: Publish the APKs as a GitHub Release (used by the in-app updater)
++        type: boolean
++        default: true
++  push:
++    tags:
++      - "firetv-v*"
++
++permissions:
++  contents: write
++
++jobs:
++  build-stream-server:
++    name: Build Stream Server ${{ matrix.abi }}
++    runs-on: ubuntu-latest
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          # Fire TV Stick Lite / Fire TV Stick (2nd/3rd gen) / most Fire OS devices.
++          - abi: armeabi-v7a
++            rust-target: armv7-linux-androideabi
++            vcpkg-triplet: arm-android
++            vcpkg-arch: arm
++            android-abi: armeabi-v7a
++            make-host: armv7a-linux-androideabi
++          # 64-bit Android TV boxes (e.g. Chromecast with Google TV, Fire TV Stick 4K Max).
++          - abi: arm64-v8a
++            rust-target: aarch64-linux-android
++            vcpkg-triplet: arm64-android
++            vcpkg-arch: arm64
++            android-abi: arm64-v8a
++            make-host: aarch64-linux-android
++
++    env:
++      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
++
++    steps:
++      - name: Checkout stream-server
++        uses: actions/checkout@v4
++        with:
++          repository: perpetus/stream-server
++          ref: 368666eb09f9c4849a7df7f2a6a8b26171f24cfb
++          path: stream-server
++
++      - name: Setup Rust
++        uses: dtolnay/rust-toolchain@stable
++        with:
++          targets: ${{ matrix.rust-target }}
++
++      - name: Install cargo-ndk
++        run: cargo install cargo-ndk
++
++      - name: Setup Android NDK
++        uses: nttld/setup-ndk@v1
++        id: setup-ndk
++        with:
++          ndk-version: r27c
++
++      - name: Export GitHub Actions cache env for vcpkg
++        uses: actions/github-script@v7
++        with:
++          script: |
++            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL);
++            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
++
++      - name: Cache vcpkg installed packages
++        uses: actions/cache@v4
++        with:
++          path: vcpkg_installed-${{ matrix.abi }}
++          key: android-vcpkg-${{ matrix.vcpkg-triplet }}-${{ hashFiles('stream-server/vcpkg.json') }}
++          restore-keys: |
++            android-vcpkg-${{ matrix.vcpkg-triplet }}-
++
++      - name: Create Android triplets
++        run: |
++          mkdir -p stream-server/triplets
++          cat > stream-server/triplets/${{ matrix.vcpkg-triplet }}.cmake << 'EOF'
++          set(VCPKG_TARGET_ARCHITECTURE ${{ matrix.vcpkg-arch }})
++          set(VCPKG_CRT_LINKAGE dynamic)
++          set(VCPKG_LIBRARY_LINKAGE static)
++          set(VCPKG_CMAKE_SYSTEM_NAME Android)
++          set(VCPKG_CMAKE_SYSTEM_VERSION 24)
++          set(VCPKG_MAKE_BUILD_TRIPLET "--host=${{ matrix.make-host }}")
++          EOF
++
++          if [[ "${{ matrix.android-abi }}" == "armeabi-v7a" ]]; then
++            echo 'set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DANDROID_ABI=armeabi-v7a -DANDROID_ARM_NEON=ON)' >> stream-server/triplets/${{ matrix.vcpkg-triplet }}.cmake
++          else
++            echo 'set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DANDROID_ABI=${{ matrix.android-abi }})' >> stream-server/triplets/${{ matrix.vcpkg-triplet }}.cmake
++          fi
++
++      - name: Setup vcpkg
++        uses: lukka/run-vcpkg@v11
++        with:
++          vcpkgGitCommitId: '84bab45d415d22042bd0b9081aea57f362da3f35'
++          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
++          vcpkgJsonGlob: 'stream-server/vcpkg.json'
++          runVcpkgInstall: false
++
++      - name: Install vcpkg dependencies
++        working-directory: stream-server
++        run: |
++          ${{ github.workspace }}/vcpkg/vcpkg install \
++            --triplet ${{ matrix.vcpkg-triplet }} \
++            --x-install-root=${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }} \
++            --overlay-triplets=triplets \
++            --overlay-ports=vcpkg-overlays
++        env:
++          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
++
++      - name: Build ${{ matrix.abi }}
++        working-directory: stream-server/server
++        run: cargo ndk --target ${{ matrix.rust-target }} --platform 24 build --release --features libtorrent --no-default-features
++        env:
++          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
++          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
++          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }}
++          VCPKGRS_TRIPLET: ${{ matrix.vcpkg-triplet }}
++          PKG_CONFIG_ALLOW_CROSS: "1"
++          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }}/${{ matrix.vcpkg-triplet }}/lib/pkgconfig
++          PKG_CONFIG_SYSROOT_DIR: ${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }}/${{ matrix.vcpkg-triplet }}
++          OPENSSL_DIR: ${{ github.workspace }}/vcpkg_installed-${{ matrix.abi }}/${{ matrix.vcpkg-triplet }}
++
++      - name: Prepare JNI libs
++        run: |
++          mkdir -p jniLibs/${{ matrix.abi }}
++          cp stream-server/target/${{ matrix.rust-target }}/release/libstream_server.so jniLibs/${{ matrix.abi }}/
++
++      - name: Upload JNI libs
++        uses: actions/upload-artifact@v4
++        with:
++          name: firetv-stream-server-jniLibs-${{ matrix.abi }}
++          path: jniLibs/
++
++  apk:
++    name: Build Fire TV APK
++    runs-on: ubuntu-latest
++    needs: build-stream-server
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++        with:
++          submodules: recursive
++
++      - name: Download stream-server JNI libs
++        uses: actions/download-artifact@v4
++        with:
++          pattern: firetv-stream-server-jniLibs-*
++          path: app/src/main/jniLibs/
++          merge-multiple: true
++
++      - name: Verify JNI libs
++        run: |
++          for abi in armeabi-v7a arm64-v8a; do
++            test -f "app/src/main/jniLibs/${abi}/libstream_server.so"
++            ls -la "app/src/main/jniLibs/${abi}/"
++          done
++
++      - name: Set up JDK
++        uses: actions/setup-java@v4
++        with:
++          distribution: temurin
++          java-version: "21"
++
++      - name: Set up Gradle
++        uses: gradle/actions/setup-gradle@v4
++
++      - name: Make Gradle executable
++        run: chmod +x ./gradlew
++
++      - name: Resolve version
++        shell: bash
++        run: |
++          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
++            version_name="${GITHUB_REF_NAME#firetv-v}"
++          else
++            version_name="${{ inputs.version_name }}"
++            if [[ -z "${version_name}" ]]; then
++              version_name="0.1.${GITHUB_RUN_NUMBER}"
++            fi
++          fi
++          echo "VERSION_NAME=${version_name}" >> "${GITHUB_ENV}"
++          echo "VERSION_CODE=${GITHUB_RUN_NUMBER}" >> "${GITHUB_ENV}"
++          echo "RELEASE_TAG=firetv-v${version_name}" >> "${GITHUB_ENV}"
++
++      - name: Prepare signing key
++        shell: bash
++        env:
++          SECRET_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
++          SECRET_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
++          SECRET_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
++          SECRET_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
++        run: |
++          keystore_file="${RUNNER_TEMP}/release.keystore"
++          if [[ -n "${SECRET_KEYSTORE_BASE64}" && -n "${SECRET_KEYSTORE_PASSWORD}" && -n "${SECRET_KEY_ALIAS}" && -n "${SECRET_KEY_PASSWORD}" ]]; then
++            printf '%s' "${SECRET_KEYSTORE_BASE64}" | base64 --decode > "${keystore_file}"
++            echo "Using the signing key from repository secrets."
++            echo "ANDROID_KEYSTORE_PASSWORD=${SECRET_KEYSTORE_PASSWORD}" >> "${GITHUB_ENV}"
++            echo "ANDROID_KEY_ALIAS=${SECRET_KEY_ALIAS}" >> "${GITHUB_ENV}"
++            echo "ANDROID_KEY_PASSWORD=${SECRET_KEY_PASSWORD}" >> "${GITHUB_ENV}"
++          else
++            echo "::warning::No signing secrets configured: signing with a temporary key generated for this run."
++            keytool -genkeypair -noprompt \
++              -keystore "${keystore_file}" -storetype PKCS12 \
++              -alias firetv -keyalg RSA -keysize 2048 -validity 10000 \
++              -storepass firetvtemp -keypass firetvtemp \
++              -dname "CN=Stremio Fire TV (temporary key)"
++            echo "ANDROID_KEYSTORE_PASSWORD=firetvtemp" >> "${GITHUB_ENV}"
++            echo "ANDROID_KEY_ALIAS=firetv" >> "${GITHUB_ENV}"
++            echo "ANDROID_KEY_PASSWORD=firetvtemp" >> "${GITHUB_ENV}"
++          fi
++          echo "ANDROID_KEYSTORE_FILE=${keystore_file}" >> "${GITHUB_ENV}"
++
++      - name: Build release APK
++        run: >
++          ./gradlew
++          :mpv-android-lib:assembleRelease
++          :app:assembleRelease
++          --warning-mode all
++          -PVERSION_CODE=${VERSION_CODE}
++          -PVERSION_NAME=${VERSION_NAME}
++          -PUPDATE_REPOSITORY=${{ github.repository }}
++
++      - name: Collect APKs
++        shell: bash
++        run: |
++          rm -rf dist
++          python .github/scripts/collect-apks.py \
++            --metadata app/build/outputs/apk/release/output-metadata.json \
++            --apk-dir app/build/outputs/apk/release \
++            --output-dir dist \
++            --version-name "${VERSION_NAME}" \
++            --build-type release
++          ls -la dist
++          test -f "dist/StremioMobile-v${VERSION_NAME}-armeabi-v7a-release.apk"
++
++      - name: Upload workflow artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: stremio-firetv-${{ env.VERSION_NAME }}
++          path: dist/*
++          if-no-files-found: error
++
++      - name: Publish GitHub Release
++        if: ${{ github.event_name == 'push' || inputs.publish_release }}
++        shell: bash
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
++            gh release create "${RELEASE_TAG}" \
++              --title "Stremio Fire TV ${VERSION_NAME}" \
++              --notes "Fire TV / Android TV build ${VERSION_NAME}. Fire TV Stick Lite: use the armeabi-v7a APK."
++          fi
++          gh release upload "${RELEASE_TAG}" dist/* --clobber
+diff --git a/FIRE_TV.md b/FIRE_TV.md
+new file mode 100644
+index 0000000..de135eb
+--- /dev/null
++++ b/FIRE_TV.md
+@@ -0,0 +1,143 @@
++# Stremio per Amazon Fire TV Stick Lite (e Android TV)
++
++Questa versione del progetto aggiunge il supporto completo a TV e telecomando (D-pad) senza
++rimuovere nulla: su telefoni e tablet l'app si comporta esattamente come prima, perché tutta la
++logica TV si attiva solo quando l'app rileva un dispositivo TV (Fire TV, Android/Google TV o
++qualunque dispositivo senza touchscreen).
++
++## Cosa è stato modificato
++
++| File | Modifica |
++|---|---|
++| `app/src/main/AndroidManifest.xml` | `android.software.leanback`, `android.hardware.touchscreen` e `android.hardware.faketouch` dichiarati `required="false"`; categoria `android.intent.category.LEANBACK_LAUNCHER` nella MainActivity; `android:banner` per la home di Fire TV. |
++| `app/src/main/res/drawable/tv_banner.xml` | Nuovo banner 160×90 dp (320×180 px) per il launcher TV. |
++| `presentation/tv/TvSupport.kt` (nuovo) | Rilevamento TV (`TvDevice`), `LocalIsTvDevice`, `TvFocusIndication` (evidenziazione del focus per tutti i `clickable`), modificatori `tvFocusRing`, `tvFocusScale`, `tvFocusTrap`, `notFocusable`. |
++| `presentation/tv/TvNavigationRail.kt` (nuovo) | Barra di navigazione laterale (Cerca, Home, Discover, Library, Settings) usata su TV al posto della bottom bar. |
++| `MainActivity.kt` | Su TV: testo scalato del 15% per la visione a distanza (anche in dialog e popup) e flag TV fornito a Compose. |
++| `StremioMobileApp.kt` | Indicazione di focus TV globale; tasto Indietro: dalle sezioni secondarie torna a Home, su Home serve una doppia pressione per uscire; focus intrappolato nella sovrapposizione in primo piano (ricerca, dettaglio, addon, stream); ripristino del focus sull'elemento di partenza alla chiusura; rail laterale; griglie a 6 colonne; dettaglio/addon limitati a 820 dp di larghezza. |
++| `PlayerScreen.kt` | Telecomando nel player: a controlli nascosti ←/→ = −/+ 10 s (durata configurabile nelle impostazioni), OK = play/pausa, ↑/↓/Menu = mostra i controlli; tasti media (Play/Pausa, Avanti veloce, Indietro veloce) sempre attivi; Indietro chiude prima i controlli e poi il player; auto-hide a 5 s su TV; il focus non esce mai dal player. |
++| `player/PlayerControls.kt` | Anello di focus su tutti i pulsanti, gli slider e le voci di menu; focus iniziale sul pulsante play/pausa (o su Indietro durante il buffering). |
++| `ThemedComponents.kt` | Anello di focus su Button/IconButton/TextButton/Switch/Slider; su TV vengono usati Switch e Slider Material (pilotabili con il D-pad) al posto delle varianti "Liquid Glass" solo touch. Le impostazioni restano identiche. |
++| `PosterComponents.kt`, `FeaturedHero.kt` | Poster ingranditi dell'8% quando hanno il focus; il carosello in evidenza non scorre da solo mentre ha il focus. |
++| `DetailSheet.kt`, `SettingsPanel.kt`, `AuthFlow.kt` | Anello di focus sugli elementi che non usano l'indicazione standard. |
++| `UpdateRepository.kt`, `app/build.gradle.kts` | Repository degli aggiornamenti in-app configurabile (`-PUPDATE_REPOSITORY=utente/repo`), così una build Fire TV non propone di installare la versione upstream per telefoni. |
++| `.github/workflows/firetv-apk.yml` (nuovo) | Workflow GitHub Actions che compila l'APK per Fire TV con lo streaming server nativo incluso. |
++
++### Comandi del telecomando
++
++| Dove | Tasto | Azione |
++|---|---|---|
++| Ovunque | ↑ ↓ ← → | Sposta il focus (riquadro bianco ben visibile) |
++| Ovunque | OK (centrale) | Apre/attiva l'elemento selezionato |
++| Board | ← dal bordo sinistro | Entra nella barra laterale |
++| Board, sezione ≠ Home | Indietro | Torna a Home |
++| Home | Indietro ×2 (entro 2 s) | Esce dall'app |
++| Pannelli (dettaglio, stream, ricerca) | Indietro | Chiude il pannello, il focus torna dov'era |
++| Player, controlli nascosti | ← / → | −/+ 10 s |
++| Player, controlli nascosti | OK | Play/pausa e mostra i controlli |
++| Player, controlli nascosti | ↑ / ↓ / Menu | Mostra i controlli |
++| Player, controlli visibili | Indietro | Nasconde i controlli (seconda pressione: esce) |
++| Player, sulla barra di avanzamento | ← / → | Scorre dell'1% della durata |
++| Player | ⏯ ⏪ ⏩ | Play/pausa, −10 s, +10 s |
++
++## Come ottenere l'APK
++
++Il Fire TV Stick Lite usa Fire OS 7 (Android 9) a 32 bit: serve l'APK **armeabi-v7a**.
++
++### Opzione A (consigliata): GitHub Actions, nessun SDK da installare
++
++Lo streaming server per i torrent è una libreria Rust che va compilata con NDK, Rust e vcpkg.
++Il workflow incluso fa tutto da solo.
++
++1. Metti il progetto su un tuo repository GitHub (anche privato), in uno dei due modi:
++   - **Dallo zip** (contiene già tutti i sorgenti, submodule inclusi):
++     ```bash
++     cd stremio-android
++     git init -b main
++     git add -A
++     git commit -m "Stremio Android con supporto Fire TV"
++     git remote add origin https://github.com/TUO_UTENTE/stremio-firetv.git
++     git push -u origin main
++     ```
++   - **Da un fork** di `pinasu/stremio-android` applicando la patch inclusa nello zip:
++     ```bash
++     git clone --recurse-submodules https://github.com/TUO_UTENTE/stremio-android.git
++     cd stremio-android
++     git apply /percorso/FIRE_TV_CHANGES.patch
++     git add -A && git commit -m "Fire TV / Android TV support" && git push
++     ```
++   Il workflow deve trovarsi sul branch predefinito per comparire nella scheda Actions.
++2. (Facoltativo ma consigliato) crea una chiave di firma fissa, così i futuri aggiornamenti si
++   installano sopra la versione precedente senza perdere i dati:
++   ```bash
++   keytool -genkeypair -v -keystore firetv.jks -alias firetv -keyalg RSA -keysize 2048 -validity 10000
++   base64 -w0 firetv.jks > firetv.jks.b64   # su macOS: base64 -i firetv.jks -o firetv.jks.b64
++   ```
++   In Settings → Secrets and variables → Actions aggiungi: `ANDROID_RELEASE_KEYSTORE_BASE64`
++   (contenuto di `firetv.jks.b64`), `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` (`firetv`),
++   `ANDROID_KEY_PASSWORD`. Senza secret il workflow firma con una chiave temporanea.
++3. Scheda **Actions** → **Fire TV APK** → **Run workflow**. Dopo 20–40 minuti (la prima volta;
++   poi la cache accelera) trovi gli APK negli artifact dell'esecuzione e in **Releases**.
++4. Scarica `StremioMobile-vX.Y.Z-armeabi-v7a-release.apk`.
++
++### Opzione B: build locale con Android Studio
++
++Requisiti: JDK 21, Android Studio aggiornato con Android SDK 37 e NDK `29.0.13846066`.
++
++```bash
++cd stremio-android
++./gradlew :mpv-android-lib:assembleRelease :app:assembleRelease      # Windows: gradlew.bat ...
++```
++
++Senza chiave di firma Gradle produce APK *unsigned*, che Fire TV non installa. Firma con le
++variabili d'ambiente lette da `app/build.gradle.kts`:
++
++```bash
++export ANDROID_KEYSTORE_FILE=/percorso/firetv.jks
++export ANDROID_KEYSTORE_PASSWORD=...
++export ANDROID_KEY_ALIAS=firetv
++export ANDROID_KEY_PASSWORD=...
++./gradlew :mpv-android-lib:assembleRelease :app:assembleRelease
++```
++
++L'APK è in `app/build/outputs/apk/release/` (file con `armeabi-v7a` nel nome).
++
++In alternativa, per una prova veloce: `./gradlew :app:assembleDebug` (firma di debug automatica,
++ma include LeakCanary ed è più pesante sul Fire Stick Lite).
++
++Nota: in una build locale lo streaming server Rust (`libstream_server.so`) non viene compilato
++automaticamente. L'app funziona lo stesso (stream HTTP e debrid), ma la riproduzione dei torrent
++richiede la libreria: compilala con `./gradlew compileNativeLibs` (servono Rust, `cargo-ndk` e
++vcpkg) oppure usa l'opzione A.
++
++## Installazione sul Fire TV Stick Lite (sideload)
++
++1. Sul Fire TV: **Impostazioni → La mia Fire TV → Informazioni**, premi 7 volte sul nome del
++   dispositivo per attivare le **Opzioni sviluppatore**.
++2. **Impostazioni → La mia Fire TV → Opzioni sviluppatore**: attiva **Debug ADB** e consenti
++   le **app da fonti sconosciute** (per l'app che userai per installare, es. Downloader).
++3. Installa l'APK in uno dei due modi:
++   - **ADB dal computer** (stessa rete Wi-Fi; l'IP è in Impostazioni → La mia Fire TV →
++     Informazioni → Rete):
++     ```bash
++     adb connect 192.168.1.50:5555
++     adb install -r StremioMobile-vX.Y.Z-armeabi-v7a-release.apk
++     ```
++     Al primo collegamento conferma sulla TV la richiesta di debug.
++   - **App Downloader** (dall'Appstore Amazon): inserisci il link diretto all'APK (ad es. quello
++     della Release su GitHub, se il repository è pubblico) e conferma l'installazione.
++4. L'app compare in **App e canali** con il banner Stremio; puoi spostarla nella riga principale.
++
++Se esiste già una versione firmata con un'altra chiave: `adb uninstall com.stremio.mobile` prima
++di installare.
++
++## Note per il Fire TV Stick Lite
++
++- Lascia lo stile **Classic** (Impostazioni → Interface): gli effetti "Liquid Glass" su Fire OS 7
++  (Android 9) ricadono comunque su una versione semplificata, ma Classic è il più leggero per
++  1 GB di RAM.
++- Il player predefinito ExoPlayer usa la decodifica hardware ed è la scelta migliore; MPV resta
++  disponibile nelle impostazioni del player.
++- Login con Facebook e autenticazione Trakt aprono il browser: su Fire TV serve un browser
++  installato (Silk). Il login con email e password funziona direttamente.
++- Il campo di ricerca apre la tastiera a schermo di Fire TV; ↑/↓ escono dal campo.
+diff --git a/README.md b/README.md
+index 73efddf..f918165 100644
+--- a/README.md
++++ b/README.md
+@@ -231,7 +231,7 @@ The MPV rebuild script is intended for Linux/macOS environments. stream-server n
+ - MPV support is vendored source plus native outputs, not a Maven runtime dependency.
+ - The app targets Android package `com.stremio.mobile`.
+ - Supported native ABIs are currently `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`.
+-- The project is optimized for phone UI. TV/D-pad behavior is not the primary target.
++- The project is optimized for phone UI. Android TV / Amazon Fire TV (D-pad remote, leanback launcher) is supported through the TV layer in `presentation/tv/`, which is only active on TV devices. See [FIRE_TV.md](FIRE_TV.md) for details and the Fire TV build/sideload guide.
+ 
+ ## Useful Commands
+ 
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 4bf975b..ba19f37 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -36,6 +36,9 @@ if (localPropertiesFile.exists()) {
+ }
+ val posthogApiKey = (localProperties.getProperty("posthog.apiKey") ?: System.getenv("POSTHOG_API_KEY") ?: "").trim()
+ val posthogHost = (localProperties.getProperty("posthog.host") ?: System.getenv("POSTHOG_HOST") ?: "https://us.i.posthog.com").trim()
++// GitHub "owner/repo" used by the in-app updater. Forks (such as the Fire TV build) can point it
++// at their own releases with -PUPDATE_REPOSITORY=owner/repo or the UPDATE_REPOSITORY env var.
++val updateRepository = (stringPropertyOrEnv("UPDATE_REPOSITORY") ?: "perpetus/stremio-android").trim()
+ 
+ android {
+     namespace = "com.stremio.mobile"
+@@ -60,6 +63,7 @@ android {
+         }
+         buildConfigField("String", "POSTHOG_API_KEY", "\"$posthogApiKey\"")
+         buildConfigField("String", "POSTHOG_HOST", "\"$posthogHost\"")
++        buildConfigField("String", "UPDATE_REPOSITORY", "\"$updateRepository\"")
+     }
+ 
+     splits {
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 243a3a0..9803872 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -11,6 +11,18 @@
+     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+ 
++    <!-- Android TV / Amazon Fire TV (Fire TV Stick Lite): the app runs with a D-pad remote and
++         does not require a touchscreen. required="false" keeps phones and tablets supported. -->
++    <uses-feature
++        android:name="android.software.leanback"
++        android:required="false" />
++    <uses-feature
++        android:name="android.hardware.touchscreen"
++        android:required="false" />
++    <uses-feature
++        android:name="android.hardware.faketouch"
++        android:required="false" />
++
+     <queries>
+         <package android:name="com.facebook.katana" />
+     </queries>
+@@ -18,6 +30,7 @@
+     <application
+         android:name=".MainApplication"
+         android:allowBackup="true"
++        android:banner="@drawable/tv_banner"
+         android:icon="@mipmap/ic_launcher"
+         android:label="@string/app_name"
+         android:supportsRtl="true"
+@@ -94,11 +107,14 @@
+             android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize"
+             android:exported="true"
+             android:launchMode="singleTask"
++            android:banner="@drawable/tv_banner"
+             android:supportsPictureInPicture="true"
+             android:theme="@style/Theme.Splash">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+                 <category android:name="android.intent.category.LAUNCHER" />
++                <!-- Shows the app in the Android TV / Fire TV home screen (Leanback launcher). -->
++                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+             </intent-filter>
+ 
+             <intent-filter>
+diff --git a/app/src/main/java/com/stremio/mobile/MainActivity.kt b/app/src/main/java/com/stremio/mobile/MainActivity.kt
+index c980c67..120d0fe 100644
+--- a/app/src/main/java/com/stremio/mobile/MainActivity.kt
++++ b/app/src/main/java/com/stremio/mobile/MainActivity.kt
+@@ -1,19 +1,24 @@
+ package com.stremio.mobile
+ 
+ import android.Manifest
++import android.content.Context
+ import android.content.Intent
++import android.content.res.Configuration
+ import android.os.Build
+ import android.os.Bundle
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.activity.viewModels
++import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+ import androidx.core.view.WindowCompat
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.ViewModelProvider
+ import com.stremio.mobile.auth.FacebookLoginBridge
+ import com.stremio.mobile.presentation.screens.StremioMobileApp
++import com.stremio.mobile.presentation.tv.LocalIsTvDevice
++import com.stremio.mobile.presentation.tv.TvDevice
+ import com.stremio.mobile.presentation.viewmodel.MainViewModel
+ 
+ class MainActivity : ComponentActivity() {
+@@ -42,6 +47,20 @@ class MainActivity : ComponentActivity() {
+         }
+     }
+ 
++    /**
++     * On TV (Fire TV Stick / Android TV) text is scaled up a little for 10-foot viewing. Applied
++     * as a configuration override so it also reaches dialogs and popups.
++     */
++    override fun attachBaseContext(newBase: Context) {
++        super.attachBaseContext(newBase)
++        if (TvDevice.isTv(newBase)) {
++            val override = Configuration().apply {
++                fontScale = newBase.resources.configuration.fontScale * TvDevice.TV_FONT_SCALE
++            }
++            applyOverrideConfiguration(override)
++        }
++    }
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         val splashScreen = installSplashScreen()
+         splashScreen.setKeepOnScreenCondition {
+@@ -52,8 +71,11 @@ class MainActivity : ComponentActivity() {
+         requestNotificationPermission()
+         viewModel.acceptIntent(intent)
+ 
++        val isTv = TvDevice.isTv(this)
+         setContent {
+-            StremioMobileApp(viewModel = viewModel)
++            CompositionLocalProvider(LocalIsTvDevice provides isTv) {
++                StremioMobileApp(viewModel = viewModel)
++            }
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/components/FeaturedHero.kt b/app/src/main/java/com/stremio/mobile/presentation/components/FeaturedHero.kt
+index f5ff245..c03bbf8 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/components/FeaturedHero.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/components/FeaturedHero.kt
+@@ -20,6 +20,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+@@ -60,11 +65,14 @@ fun FeaturedHeroPager(
+     }
+ 
+     val pagerState = rememberPagerState(pageCount = { items.size })
++    // On TV the auto-advance pauses while the hero has D-pad focus, otherwise the focused page
++    // would slide away from under the user.
++    var heroHasFocus by remember { mutableStateOf(false) }
+ 
+     LaunchedEffect(key1 = items) {
+         while (true) {
+             kotlinx.coroutines.delay(5000)
+-            if (!pagerState.isScrollInProgress) {
++            if (!pagerState.isScrollInProgress && !heroHasFocus) {
+                 val nextPage = (pagerState.currentPage + 1) % items.size
+                 pagerState.animateScrollToPage(nextPage)
+             }
+@@ -75,6 +83,7 @@ fun FeaturedHeroPager(
+         modifier = modifier
+             .fillMaxWidth()
+             .height(230.dp)
++            .onFocusChanged { heroHasFocus = it.hasFocus }
+     ) {
+         HorizontalPager(
+             state = pagerState,
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/components/PosterComponents.kt b/app/src/main/java/com/stremio/mobile/presentation/components/PosterComponents.kt
+index df5a36e..2a339ce 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/components/PosterComponents.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/components/PosterComponents.kt
+@@ -49,6 +49,7 @@ import com.stremio.mobile.core.theme.MutedText
+ import com.stremio.mobile.core.theme.ScreenGutter
+ import com.stremio.mobile.data.model.CatalogItem
+ import com.stremio.mobile.data.model.CatalogShelf
++import com.stremio.mobile.presentation.tv.tvFocusScale
+ 
+ enum class ShelfMode {
+     Continue,
+@@ -146,6 +147,7 @@ fun PosterTile(
+ ) {
+     Box(
+         modifier = Modifier
++            .tvFocusScale(1.08f)
+             .width(112.dp)
+             .aspectRatio(0.66f)
+             .clip(RoundedCornerShape(18.dp))
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/components/ThemedComponents.kt b/app/src/main/java/com/stremio/mobile/presentation/components/ThemedComponents.kt
+index f733b43..f2920e1 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/components/ThemedComponents.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/components/ThemedComponents.kt
+@@ -1,5 +1,8 @@
+ package com.stremio.mobile.presentation.components
+ 
++import com.stremio.mobile.presentation.tv.LocalIsTvDevice
++import com.stremio.mobile.presentation.tv.tvFocusRing
++
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.BoxScope
+ import androidx.compose.foundation.layout.ColumnScope
+@@ -232,7 +235,7 @@ fun ThemedButton(
+     } else {
+         Button(
+             onClick = combinedOnClick,
+-            modifier = modifier,
++            modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)).then(modifier),
+             enabled = enabled,
+             colors = ButtonDefaults.buttonColors(
+                 containerColor = containerColor,
+@@ -302,7 +305,7 @@ fun ThemedTextButton(
+     } else {
+         TextButton(
+             onClick = combinedOnClick,
+-            modifier = modifier,
++            modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)).then(modifier),
+             enabled = enabled,
+         ) {
+             Text(text = text)
+@@ -372,13 +375,15 @@ fun ThemedIconButton(
+         IconButton(
+             onClick = combinedOnClick,
+             enabled = enabled,
+-            modifier = if (containerColor != null) {
+-                modifier
+-                    .clip(CircleShape)
+-                    .background(containerColor)
+-            } else {
+-                modifier
+-            },
++            modifier = Modifier.tvFocusRing(CircleShape).then(
++                if (containerColor != null) {
++                    modifier
++                        .clip(CircleShape)
++                        .background(containerColor)
++                } else {
++                    modifier
++                }
++            ),
+         ) {
+             Icon(
+                 imageVector = imageVector,
+@@ -470,7 +475,8 @@ fun ThemedToggle(
+         onCheckedChange(it)
+     }
+     
+-    if (theme.style == "modern") {
++    // LiquidToggle is drag/touch-only: on TV the D-pad friendly Material Switch is always used.
++    if (theme.style == "modern" && !LocalIsTvDevice.current) {
+         LiquidToggle(
+             checked = checked,
+             onCheckedChange = combinedOnCheckedChange,
+@@ -481,7 +487,7 @@ fun ThemedToggle(
+         Switch(
+             checked = checked,
+             onCheckedChange = combinedOnCheckedChange,
+-            modifier = modifier,
++            modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)).then(modifier),
+             colors = SwitchDefaults.colors(
+                 checkedThumbColor = androidx.compose.ui.graphics.Color.White,
+                 checkedTrackColor = AccentPurple,
+@@ -519,7 +525,9 @@ fun ThemedSlider(
+     val resolvedBackdrop = backdrop ?: LocalGlobalBackdrop.current
+     val triggerHaptic = rememberGlobalHapticFeedback()
+     
+-    if (theme.style == "modern") {
++    // LiquidSlider is drag/touch-only: on TV the Material Slider (moved with D-pad left/right)
++    // is always used.
++    if (theme.style == "modern" && !LocalIsTvDevice.current) {
+         LiquidSlider(
+             value = value,
+             onValueChange = {
+@@ -540,7 +548,7 @@ fun ThemedSlider(
+             },
+             onValueChangeFinished = onValueChangeFinished,
+             valueRange = valueRange,
+-            modifier = modifier,
++            modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)).then(modifier),
+             colors = SliderDefaults.colors(
+                 thumbColor = AccentPurple,
+                 activeTrackColor = AccentPurple
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/screens/AuthFlow.kt b/app/src/main/java/com/stremio/mobile/presentation/screens/AuthFlow.kt
+index 322469f..7dd2afb 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/screens/AuthFlow.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/screens/AuthFlow.kt
+@@ -1,5 +1,6 @@
+ package com.stremio.mobile.presentation.screens
+ 
++import com.stremio.mobile.presentation.tv.tvFocusRing
+ import android.app.Activity
+ import android.content.Context
+ import android.content.ContextWrapper
+@@ -496,6 +497,7 @@ private fun AuthCheckRow(
+         Checkbox(
+             checked = checked,
+             onCheckedChange = onCheckedChange,
++            modifier = Modifier.tvFocusRing(RoundedCornerShape(8.dp)),
+             colors = CheckboxDefaults.colors(
+                 checkedColor = AccentPurple,
+                 uncheckedColor = MutedText,
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/screens/DetailSheet.kt b/app/src/main/java/com/stremio/mobile/presentation/screens/DetailSheet.kt
+index bd9e4a5..86405ef 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/screens/DetailSheet.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/screens/DetailSheet.kt
+@@ -1,5 +1,6 @@
+ package com.stremio.mobile.presentation.screens
+ 
++import com.stremio.mobile.presentation.tv.tvFocusRing
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.border
+ import androidx.compose.foundation.clickable
+@@ -247,6 +248,8 @@ private fun DetailLiquidActionButton(
+ 
+     Box(
+         modifier = modifier
++            // indication = null below: draw an explicit focus ring for the TV remote.
++            .tvFocusRing(shape)
+             .scale(scale)
+             .then(
+                 if (realGlass) {
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/screens/PlayerScreen.kt b/app/src/main/java/com/stremio/mobile/presentation/screens/PlayerScreen.kt
+index d18e506..8ef7ab1 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/screens/PlayerScreen.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/screens/PlayerScreen.kt
+@@ -10,6 +10,19 @@ import android.content.pm.ActivityInfo
+ import android.media.AudioManager
+ import android.net.Uri
+ import android.view.View
++import android.view.KeyEvent as AndroidKeyEvent
++import androidx.compose.foundation.focusGroup
++import androidx.compose.foundation.focusable
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusProperties
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.input.key.KeyEvent
++import androidx.compose.ui.input.key.KeyEventType
++import androidx.compose.ui.input.key.onPreviewKeyEvent
++import androidx.compose.ui.input.key.type
++import com.stremio.mobile.presentation.tv.LocalIsTvDevice
++import com.stremio.mobile.presentation.tv.tvFocusTrap
+ import androidx.activity.compose.BackHandler
+ import androidx.activity.compose.rememberLauncherForActivityResult
+ import androidx.activity.result.contract.ActivityResultContracts
+@@ -129,7 +142,6 @@ fun PlayerScreen(
+     liquidGlassTuning: LiquidGlassTuning = LiquidGlassTuning(),
+     modifier: Modifier = Modifier,
+ ) {
+-    BackHandler(onBack = onBack)
+ 
+     val runtimeStateHolder = player?.runtimeState?.collectAsState()
+         ?: remember { mutableStateOf(PlayerRuntimeState()) }
+@@ -186,6 +198,25 @@ fun PlayerScreen(
+     // playback transitions it triggers, so a swipe/double-tap seek never wakes the controls.
+     var lastSilentSeekMs by remember { mutableStateOf(0L) }
+ 
++    // ---- TV remote (Fire TV / Android TV) --------------------------------------------------
++    val isTv = LocalIsTvDevice.current
++    // Invisible full-screen focus target that receives the remote keys while the controls are
++    // hidden; the primary control (play/pause) receives focus when they are shown.
++    val tvSinkFocus = remember { FocusRequester() }
++    val tvPrimaryFocus = remember { FocusRequester() }
++    var tvSinkFocused by remember { mutableStateOf(false) }
++    var tvPlayerHasFocus by remember { mutableStateOf(false) }
++
++    // Back: on TV the first press only hides the controls overlay, the next one leaves the
++    // player (classic TV player behaviour). On phones Back leaves the player as before.
++    BackHandler {
++        if (isTv && showControls && playbackError == null) {
++            showControls = false
++        } else {
++            onBack()
++        }
++    }
++
+     val context = LocalContext.current
+     val activity = remember(context) { context.findActivity() }
+     val audioManager = remember(context) { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+@@ -395,8 +426,10 @@ fun PlayerScreen(
+     // Inactivity Auto-Hide Timer
+     LaunchedEffect(showControls, isPlaying, lastActivityTime) {
+         if (showControls && isPlaying) {
+-            delay(3000)
+-            if (System.currentTimeMillis() - lastActivityTime >= 3000) {
++            // A little longer on TV, where the controls are operated from a remote.
++            val hideAfterMs = if (isTv) 5000L else 3000L
++            delay(hideAfterMs)
++            if (System.currentTimeMillis() - lastActivityTime >= hideAfterMs) {
+                 showControls = false
+             }
+         }
+@@ -600,8 +633,116 @@ fun PlayerScreen(
+             showStatsPanel = !showStatsPanel
+             resetActivityTimer()
+         },
++        tvPrimaryFocusRequester = if (isTv) tvPrimaryFocus else null,
+     )
+ 
++    // Seek used by the remote while the controls are hidden: like a double-tap, it shows only
++    // the transient +/- indicator and keeps the video unobstructed.
++    fun tvSeekSilently(forward: Boolean) {
++        val step = profileSettings?.seekTimeDuration ?: 10000L
++        val target = if (forward) positionMs + step else positionMs - step
++        val newPos = if (durationMs > 0) target.coerceIn(0L, durationMs) else target.coerceAtLeast(0L)
++        seekToSilently(newPos)
++        if (forward) gestureState.showRightSeekIndicator = true else gestureState.showLeftSeekIndicator = true
++    }
++
++    fun handleTvKey(event: KeyEvent): Boolean {
++        if (!isTv) return false
++        val native = event.nativeKeyEvent
++        val isDown = event.type == KeyEventType.KeyDown
++        val firstPress = isDown && native.repeatCount == 0
++        // Media keys of the Fire TV remote work in every state.
++        when (native.keyCode) {
++            AndroidKeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
++            AndroidKeyEvent.KEYCODE_HEADSETHOOK -> {
++                if (firstPress) controlsActions.onPlayPause()
++                return true
++            }
++            AndroidKeyEvent.KEYCODE_MEDIA_PLAY -> {
++                if (firstPress && !isPlaying) controlsActions.onPlayPause()
++                return true
++            }
++            AndroidKeyEvent.KEYCODE_MEDIA_PAUSE -> {
++                if (firstPress && isPlaying) controlsActions.onPlayPause()
++                return true
++            }
++            AndroidKeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
++                if (isDown) tvSeekSilently(forward = true)
++                return true
++            }
++            AndroidKeyEvent.KEYCODE_MEDIA_REWIND -> {
++                if (isDown) tvSeekSilently(forward = false)
++                return true
++            }
++            AndroidKeyEvent.KEYCODE_MENU -> {
++                if (firstPress) resetActivityTimer()
++                return true
++            }
++        }
++        // The error overlay has its own buttons: let the D-pad drive them normally.
++        if (playbackError != null) return false
++        val isDpadKey = when (native.keyCode) {
++            AndroidKeyEvent.KEYCODE_DPAD_UP,
++            AndroidKeyEvent.KEYCODE_DPAD_DOWN,
++            AndroidKeyEvent.KEYCODE_DPAD_LEFT,
++            AndroidKeyEvent.KEYCODE_DPAD_RIGHT,
++            AndroidKeyEvent.KEYCODE_DPAD_CENTER,
++            AndroidKeyEvent.KEYCODE_ENTER,
++            AndroidKeyEvent.KEYCODE_NUMPAD_ENTER -> true
++            else -> false
++        }
++        if (!isDpadKey) return false
++        if (tvSinkFocused) {
++            // Controls hidden: left/right seek, centre toggles play/pause (and shows the
++            // controls), up/down just bring the controls up.
++            if (isDown) {
++                when (native.keyCode) {
++                    AndroidKeyEvent.KEYCODE_DPAD_LEFT -> tvSeekSilently(forward = false)
++                    AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> tvSeekSilently(forward = true)
++                    AndroidKeyEvent.KEYCODE_DPAD_CENTER,
++                    AndroidKeyEvent.KEYCODE_ENTER,
++                    AndroidKeyEvent.KEYCODE_NUMPAD_ENTER -> if (firstPress) controlsActions.onPlayPause()
++                    else -> if (firstPress) resetActivityTimer()
++                }
++            }
++            return true
++        }
++        // Controls visible: normal D-pad navigation between the buttons; every key press keeps
++        // the overlay alive.
++        if (isDown && showControls) {
++            lastActivityTime = System.currentTimeMillis()
++        }
++        return false
++    }
++
++    // Move the D-pad focus to the right place whenever the controls appear or disappear.
++    if (isTv) {
++        LaunchedEffect(showControls, playbackError == null) {
++            if (playbackError != null) return@LaunchedEffect
++            repeat(20) {
++                runCatching {
++                    if (showControls) tvPrimaryFocus.requestFocus() else tvSinkFocus.requestFocus()
++                }
++                delay(50)
++                if (!showControls && tvSinkFocused) return@LaunchedEffect
++                if (showControls && tvPlayerHasFocus && !tvSinkFocused) return@LaunchedEffect
++            }
++        }
++        // Safety net: if the focused control disappears (e.g. buffering hides the centre
++        // button), put focus back inside the player instead of losing it.
++        LaunchedEffect(tvPlayerHasFocus) {
++            if (tvPlayerHasFocus || playbackError != null) return@LaunchedEffect
++            delay(150)
++            repeat(10) {
++                if (tvPlayerHasFocus || playbackError != null) return@LaunchedEffect
++                runCatching {
++                    if (showControls) tvPrimaryFocus.requestFocus() else tvSinkFocus.requestFocus()
++                }
++                delay(100)
++            }
++        }
++    }
++
+     val globalTheme = remember(
+         globalUiStyle,
+         glassEffectsMode,
+@@ -630,6 +771,18 @@ fun PlayerScreen(
+         Box(
+             modifier = modifier
+                 .fillMaxSize()
++                .then(
++                    if (isTv) {
++                        Modifier
++                            .onFocusChanged { tvPlayerHasFocus = it.hasFocus }
++                            .onPreviewKeyEvent { handleTvKey(it) }
++                            // The player covers the whole app: never let the D-pad leave it.
++                            .focusProperties { onExit = { cancelFocusChange() } }
++                            .focusGroup()
++                    } else {
++                        Modifier
++                    }
++                )
+                 .background(Color.Black),
+         ) {
+             // Backend-provided player view.
+@@ -709,12 +862,25 @@ fun PlayerScreen(
+                 )
+         )
+ 
++        // TV: remote-key receiver while the controls are hidden (see handleTvKey).
++        if (isTv) {
++            Box(
++                modifier = Modifier
++                    .fillMaxSize()
++                    .focusRequester(tvSinkFocus)
++                    .onFocusChanged { tvSinkFocused = it.isFocused }
++                    .focusProperties { canFocus = !showControls }
++                    .focusable()
++            )
++        }
++
+         // Playback error overlay — shown when the codec/source fails so it's visible instead
+         // of an infinite buffering spinner, with a one-tap retry.
+         if (playbackError != null) {
+             Box(
+                 modifier = Modifier
+                     .fillMaxSize()
++                    .tvFocusTrap(active = true)
+                     .background(Color(0xCC000000)),
+                 contentAlignment = Alignment.Center,
+             ) {
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/screens/SettingsPanel.kt b/app/src/main/java/com/stremio/mobile/presentation/screens/SettingsPanel.kt
+index a2c1282..6b2e827 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/screens/SettingsPanel.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/screens/SettingsPanel.kt
+@@ -1,5 +1,6 @@
+ package com.stremio.mobile.presentation.screens
+ 
++import com.stremio.mobile.presentation.tv.tvFocusRing
+ import android.content.Context
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.clickable
+@@ -379,6 +380,7 @@ fun <T> SettingsDropdownRow(
+                 ) {
+                     options.forEach { (value, label) ->
+                         DropdownMenuItem(
++                            modifier = Modifier.tvFocusRing(),
+                             text = { Text(text = label, color = Color.White) },
+                             onClick = {
+                                 triggerHaptic()
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/screens/StremioMobileApp.kt b/app/src/main/java/com/stremio/mobile/presentation/screens/StremioMobileApp.kt
+index 759ce81..f272c23 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/screens/StremioMobileApp.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/screens/StremioMobileApp.kt
+@@ -6,6 +6,26 @@ import androidx.compose.ui.platform.LocalContext
+ import com.stremio.mobile.server.formatServerErrorMessage
+ import com.stremio.mobile.server.StreamingServerState
+ import androidx.activity.compose.BackHandler
++import android.os.SystemClock
++import android.widget.Toast
++import androidx.compose.foundation.LocalIndication
++import androidx.compose.foundation.focusGroup
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.runtime.mutableLongStateOf
++import androidx.compose.ui.ExperimentalComposeUiApi
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.focusRestorer
++import androidx.compose.ui.focus.onFocusChanged
++import com.stremio.mobile.presentation.tv.LocalIsTvDevice
++import com.stremio.mobile.presentation.tv.TvFocusIndication
++import com.stremio.mobile.presentation.tv.TvGridColumns
++import com.stremio.mobile.presentation.tv.TvNavigationRail
++import com.stremio.mobile.presentation.tv.TvRailWidth
++import com.stremio.mobile.presentation.tv.findActivityOrNull
++import com.stremio.mobile.presentation.tv.notFocusable
++import com.stremio.mobile.presentation.tv.tvFocusRing
++import com.stremio.mobile.presentation.tv.tvFocusTrap
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.rememberScrollState
+@@ -81,11 +101,61 @@ import com.stremio.mobile.update.UpdateState
+ import java.io.File
+ import kotlin.math.roundToInt
+ 
++@OptIn(ExperimentalComposeUiApi::class)
+ @Composable
+ fun StremioMobileApp(viewModel: MainViewModel) {
+     val state by viewModel.uiState.collectAsStateWithLifecycle()
+     val streamsState by viewModel.streamsState.collectAsStateWithLifecycle()
+     val isPlayerOpen by viewModel.isPlayerOpen.collectAsStateWithLifecycle()
++
++    // ---- TV (Fire TV / Android TV) D-pad support -------------------------------------------
++    val isTv = LocalIsTvDevice.current
++    val appContext = LocalContext.current
++    // Overlays are drawn on top of each other in this order: board < search < details <
++    // addon details < streams < player. Only the top-most one traps the D-pad focus.
++    val searchOpen = state.account.isAuthenticated && state.isSearchOpen
++    val detailsOpen = state.selectedDetails != null
++    val addonDetailsOpen = state.selectedAddonDetails != null
++    val streamsOpen = streamsState.isOpen
++    val streamsOnTop = streamsOpen && !isPlayerOpen
++    val addonDetailsOnTop = addonDetailsOpen && !streamsOpen && !isPlayerOpen
++    val detailsOnTop = detailsOpen && !addonDetailsOpen && !streamsOpen && !isPlayerOpen
++    val searchOnTop = searchOpen && !detailsOpen && !addonDetailsOpen && !streamsOpen && !isPlayerOpen
++    val anyOverlayOpen = isPlayerOpen || streamsOpen || detailsOpen || addonDetailsOpen || searchOpen
++    val boardFocusRequester = remember { FocusRequester() }
++    var boardHasFocus by remember { mutableStateOf(false) }
++
++    // Lowest-priority Back handler (registered first, so every screen/overlay handler wins):
++    // on TV, Back from a secondary section returns Home, and on Home it must be pressed twice
++    // to leave the app, so a stray press on the remote never closes Stremio by accident.
++    var lastBackPressAt by remember { mutableLongStateOf(0L) }
++    BackHandler(enabled = isTv) {
++        if (state.account.isAuthenticated && state.selectedSection != MainSection.Home) {
++            viewModel.selectSection(MainSection.Home)
++        } else {
++            val now = SystemClock.elapsedRealtime()
++            if (now - lastBackPressAt < 2000L) {
++                appContext.findActivityOrNull()?.finish()
++            } else {
++                lastBackPressAt = now
++                Toast.makeText(appContext, "Press Back again to exit", Toast.LENGTH_SHORT).show()
++            }
++        }
++    }
++
++    // When every overlay is closed, give the D-pad focus back to the board; focusRestorer puts
++    // it back on the element that was focused before the overlay opened (e.g. the poster).
++    if (isTv) {
++        LaunchedEffect(anyOverlayOpen, state.account.isAuthenticated) {
++            if (!anyOverlayOpen && state.account.isAuthenticated) {
++                repeat(20) {
++                    if (boardHasFocus) return@LaunchedEffect
++                    runCatching { boardFocusRequester.requestFocus() }
++                    kotlinx.coroutines.delay(50)
++                }
++            }
++        }
++    }
+     val rootGlobalTheme = remember(
+         state.globalUiStyle,
+         state.glassEffectsMode,
+@@ -110,6 +180,8 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+         CompositionLocalProvider(
+             LocalGlobalUiTheme provides rootGlobalTheme,
+             LocalGlassAlpha provides state.globalGlassAlpha,
++            // On TV every clickable gets a strong, distance-readable focus highlight.
++            LocalIndication provides (if (isTv) TvFocusIndication else LocalIndication.current),
+         ) {
+             Box(
+                 modifier = Modifier
+@@ -117,6 +189,21 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                     .background(StremioBackgroundBrush),
+             ) {
+             if (state.account.isAuthenticated) {
++                Box(
++                    modifier = Modifier
++                        .fillMaxSize()
++                        .then(
++                            if (isTv) {
++                                Modifier
++                                    .onFocusChanged { boardHasFocus = it.hasFocus }
++                                    .focusRequester(boardFocusRequester)
++                                    .focusRestorer()
++                                    .focusGroup()
++                            } else {
++                                Modifier
++                            }
++                        ),
++                ) {
+                 BoardScreen(
+                     state = state,
+                     onRefresh = viewModel::refreshCatalogs,
+@@ -172,6 +259,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                     onInstallDownloadedUpdate = viewModel::installDownloadedUpdate,
+                     onIgnoreUpdate = viewModel::ignoreUpdate,
+                 )
++                }
+             } else {
+                 AuthFlow(
+                     isLoading = state.account.isLoading,
+@@ -193,7 +281,9 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                     onOpenDetails = viewModel::openDetails,
+                     onOpenDiscoverCatalog = viewModel::openDiscoverCatalog,
+                     onBack = viewModel::clearSearch,
+-                    modifier = Modifier.fillMaxSize(),
++                    modifier = Modifier
++                        .fillMaxSize()
++                        .tvFocusTrap(active = searchOnTop),
+                 )
+             }
+ 
+@@ -202,7 +292,10 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                 Box(
+                     modifier = Modifier
+                         .fillMaxSize()
++                        .tvFocusTrap(active = detailsOnTop)
+                         .background(Color(0x99000000))
++                        // The scrim stays tappable on touch screens but is skipped by the D-pad.
++                        .notFocusable()
+                         .clickable(
+                             interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                             indication = null
+@@ -216,6 +309,8 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                         onOpenStreams = { viewModel.openStreams(details.item) },
+                         modifier = Modifier
+                             .align(Alignment.BottomCenter)
++                            .then(if (isTv) Modifier.widthIn(max = 820.dp) else Modifier)
++                            .notFocusable()
+                             .clickable(
+                                 interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                                 indication = null
+@@ -229,7 +324,9 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                 Box(
+                     modifier = Modifier
+                         .fillMaxSize()
++                        .tvFocusTrap(active = addonDetailsOnTop)
+                         .background(Color(0x99000000))
++                        .notFocusable()
+                         .clickable(
+                             interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                             indication = null
+@@ -243,6 +340,8 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                         onUpgrade = viewModel::upgradeAddon,
+                         modifier = Modifier
+                             .align(Alignment.BottomCenter)
++                            .then(if (isTv) Modifier.widthIn(max = 820.dp) else Modifier)
++                            .notFocusable()
+                             .clickable(
+                                 interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                                 indication = null
+@@ -274,7 +373,9 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                     onSelectSeason = viewModel::selectSeason,
+                     onSelectProvider = viewModel::selectStreamProvider,
+                     onSelectSortCriterion = viewModel::selectStreamSortCriterion,
+-                    modifier = Modifier.fillMaxSize(),
++                    modifier = Modifier
++                        .fillMaxSize()
++                        .tvFocusTrap(active = streamsOnTop),
+                 )
+             }
+ 
+@@ -314,7 +415,9 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                                         uncheckedColor = MutedText,
+                                         checkmarkColor = Color.White,
+                                     ),
+-                                    modifier = Modifier.size(20.dp)
++                                    modifier = Modifier
++                                        .tvFocusRing(RoundedCornerShape(6.dp))
++                                        .size(20.dp)
+                                 )
+                                 Text(
+                                     text = "Don't show this warning again",
+@@ -326,6 +429,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                     },
+                     confirmButton = {
+                         androidx.compose.material3.TextButton(
++                            modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)),
+                             onClick = {
+                                 if (disableWarning) {
+                                     viewModel.setMobileDataWarning(false)
+@@ -338,6 +442,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                     },
+                     dismissButton = {
+                         androidx.compose.material3.TextButton(
++                            modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)),
+                             onClick = viewModel::cancelMobileDataPlayback
+                         ) {
+                             Text(text = "Cancel", color = MutedText)
+@@ -371,6 +476,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                     },
+                     confirmButton = {
+                         androidx.compose.material3.TextButton(
++                            modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)),
+                             onClick = viewModel::startServer
+                         ) {
+                             Text(text = "Retry", color = AccentPurple, fontWeight = FontWeight.Bold)
+@@ -378,6 +484,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                     },
+                     dismissButton = {
+                         androidx.compose.material3.TextButton(
++                            modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)),
+                             onClick = {
+                                 (context as? Activity)?.finish()
+                             }
+@@ -422,6 +529,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                         },
+                         confirmButton = {
+                             androidx.compose.material3.TextButton(
++                                modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)),
+                                 onClick = { viewModel.downloadAndInstallUpdate(update.info) }
+                             ) {
+                                 Text(text = "Install", color = AccentPurple, fontWeight = FontWeight.Bold)
+@@ -429,6 +537,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                         },
+                         dismissButton = {
+                             androidx.compose.material3.TextButton(
++                                modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)),
+                                 onClick = viewModel::dismissUpdateDialog
+                             ) {
+                                 Text(text = "Not Now", color = MutedText)
+@@ -510,6 +619,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                         },
+                         confirmButton = {
+                             androidx.compose.material3.TextButton(
++                                modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)),
+                                 onClick = { viewModel.installDownloadedUpdate(update.file) }
+                             ) {
+                                 Text(text = "Install", color = AccentPurple, fontWeight = FontWeight.Bold)
+@@ -517,6 +627,7 @@ fun StremioMobileApp(viewModel: MainViewModel) {
+                         },
+                         dismissButton = {
+                             androidx.compose.material3.TextButton(
++                                modifier = Modifier.tvFocusRing(RoundedCornerShape(999.dp)),
+                                 onClick = viewModel::dismissUpdateDialog
+                             ) {
+                                 Text(text = "Later", color = MutedText)
+@@ -758,6 +869,10 @@ private fun BoardScreen(
+     val navBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+     val isAddonsSettingsPage = state.selectedSection == MainSection.Settings &&
+             settingsSubScreen == SettingsSubScreen.Addons
++    // TV: content sits to the right of the navigation rail, with a TV-safe margin, and the
++    // poster grids use more columns to fill the 16:9 screen.
++    val isTv = LocalIsTvDevice.current
++    val gridColumns = if (isTv) TvGridColumns else 3
+     CompositionLocalProvider(
+         LocalGlobalUiTheme provides globalTheme,
+         LocalGlassAlpha provides state.globalGlassAlpha,
+@@ -777,8 +892,13 @@ private fun BoardScreen(
+                 modifier = Modifier
+                     .fillMaxSize()
+                     .then(if (contentBackdrop != null) Modifier.layerBackdrop(contentBackdrop) else Modifier)
+-                    .windowInsetsPadding(WindowInsets.statusBars),
+-            contentPadding = PaddingValues(bottom = BottomBarSpace + navBottom),
++                    .windowInsetsPadding(WindowInsets.statusBars)
++                    .then(if (isTv) Modifier.padding(start = TvRailWidth, end = 24.dp) else Modifier),
++            contentPadding = if (isTv) {
++                PaddingValues(top = 16.dp, bottom = 48.dp)
++            } else {
++                PaddingValues(bottom = BottomBarSpace + navBottom)
++            },
+             verticalArrangement = Arrangement.spacedBy(if (isAddonsSettingsPage) 10.dp else 27.dp),
+         ) {
+             item {
+@@ -867,7 +987,7 @@ private fun BoardScreen(
+                         item { EmptyState(state.discoverCatalog.error) }
+                     } else {
+                         val items = state.discoverCatalog.items
+-                        val chunks = items.chunked(3)
++                        val chunks = items.chunked(gridColumns)
+                         chunks.forEach { rowItems ->
+                             item {
+                                 Row(
+@@ -885,7 +1005,7 @@ private fun BoardScreen(
+                                             )
+                                         }
+                                     }
+-                                    repeat(3 - rowItems.size) {
++                                    repeat(gridColumns - rowItems.size) {
+                                         Box(modifier = Modifier.weight(1f))
+                                     }
+                                 }
+@@ -907,7 +1027,7 @@ private fun BoardScreen(
+                     if (items.isEmpty()) {
+                         item { EmptyState("Add movies and series from details to build your library.") }
+                     } else {
+-                        val chunks = items.chunked(3)
++                        val chunks = items.chunked(gridColumns)
+                         chunks.forEach { rowItems ->
+                             item {
+                                 Row(
+@@ -925,7 +1045,7 @@ private fun BoardScreen(
+                                             )
+                                         }
+                                     }
+-                                    repeat(3 - rowItems.size) {
++                                    repeat(gridColumns - rowItems.size) {
+                                         Box(modifier = Modifier.weight(1f))
+                                     }
+                                 }
+@@ -1104,12 +1224,21 @@ private fun BoardScreen(
+             }
+         }
+ 
+-        StremioBottomBar(
+-            selectedView = state.selectedSection.toAppView(),
+-            backdrop = contentBackdrop ?: appBackdrop,
+-            onSelect = { onSelectSection(it.toSection()) },
+-            modifier = Modifier.align(Alignment.BottomCenter),
+-        )
++        if (isTv) {
++            TvNavigationRail(
++                selectedView = state.selectedSection.toAppView(),
++                onSelect = { onSelectSection(it.toSection()) },
++                onOpenSearch = onOpenSearch,
++                modifier = Modifier.align(Alignment.CenterStart),
++            )
++        } else {
++            StremioBottomBar(
++                selectedView = state.selectedSection.toAppView(),
++                backdrop = contentBackdrop ?: appBackdrop,
++                onSelect = { onSelectSection(it.toSection()) },
++                modifier = Modifier.align(Alignment.BottomCenter),
++            )
++        }
+     }
+ }
+ }
+@@ -1243,7 +1372,9 @@ fun DropdownFilter(
+                         onSelectIndex(index)
+                         expanded = false
+                     },
+-                    modifier = Modifier.background(if (isSelected) AccentPurple.copy(alpha = 0.15f) else Color.Transparent)
++                    modifier = Modifier
++                        .tvFocusRing()
++                        .background(if (isSelected) AccentPurple.copy(alpha = 0.15f) else Color.Transparent)
+                 )
+             }
+         }
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/screens/player/PlayerControls.kt b/app/src/main/java/com/stremio/mobile/presentation/screens/player/PlayerControls.kt
+index 52b5ee6..0b38e60 100644
+--- a/app/src/main/java/com/stremio/mobile/presentation/screens/player/PlayerControls.kt
++++ b/app/src/main/java/com/stremio/mobile/presentation/screens/player/PlayerControls.kt
+@@ -84,6 +84,9 @@ import com.stremio.mobile.presentation.components.LiquidGlassCard
+ import com.stremio.mobile.presentation.components.GlassLegibility
+ import com.stremio.mobile.presentation.components.LocalGlassLegibility
+ import com.stremio.mobile.presentation.components.StaticGlassCard
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import com.stremio.mobile.presentation.tv.tvFocusRing
+ import kotlin.math.abs
+ 
+ data class PlayerControlsState(
+@@ -116,8 +119,17 @@ class PlayerControlsActions(
+     val onShowSubtitles: () -> Unit,
+     val onShowAudio: () -> Unit,
+     val onToggleStats: () -> Unit,
++    /**
++     * TV only: focus requester attached to the main control (play/pause, or Back while
++     * buffering) so the player can move D-pad focus there when the controls appear.
++     */
++    val tvPrimaryFocusRequester: FocusRequester? = null,
+ )
+ 
++/** Attaches the TV primary focus requester to this control when [enabled]. */
++private fun Modifier.tvPrimaryFocus(requester: FocusRequester?, enabled: Boolean = true): Modifier =
++    if (requester != null && enabled) this.focusRequester(requester) else this
++
+ @Composable
+ fun ClassicPlayerControls(
+     state: PlayerControlsState,
+@@ -161,6 +173,7 @@ fun ClassicPlayerControls(
+                 IconButton(
+                     onClick = actions.onBack,
+                     modifier = Modifier
++                        .tvFocusRing(CircleShape)
+                         .clip(CircleShape)
+                         .background(Color(0x33000000))
+                 ) {
+@@ -193,6 +206,7 @@ fun ClassicPlayerControls(
+                     IconButton(
+                         onClick = actions.onSkipBack,
+                         modifier = Modifier
++                            .tvFocusRing(CircleShape)
+                             .size(38.dp)
+                             .clip(CircleShape)
+                             .background(Color(0x33000000))
+@@ -208,6 +222,8 @@ fun ClassicPlayerControls(
+                     IconButton(
+                         onClick = actions.onPlayPause,
+                         modifier = Modifier
++                            .tvFocusRing(CircleShape)
++                            .tvPrimaryFocus(actions.tvPrimaryFocusRequester)
+                             .size(56.dp)
+                             .clip(CircleShape)
+                             .background(Color(0x4D000000))
+@@ -224,6 +240,7 @@ fun ClassicPlayerControls(
+                     IconButton(
+                         onClick = actions.onSkipForward,
+                         modifier = Modifier
++                            .tvFocusRing(CircleShape)
+                             .size(38.dp)
+                             .clip(CircleShape)
+                             .background(Color(0x33000000))
+@@ -266,6 +283,9 @@ fun ClassicPlayerControls(
+                         IconButton(
+                             onClick = actions.onPlayPause,
+                             modifier = Modifier
++                                .tvFocusRing(RoundedCornerShape(12.dp))
++                                // While buffering the big centre button is hidden: focus this one.
++                                .tvPrimaryFocus(actions.tvPrimaryFocusRequester, enabled = state.isBuffering)
+                                 .size(44.dp)
+                                 .clip(RoundedCornerShape(12.dp))
+                         ) {
+@@ -280,6 +300,7 @@ fun ClassicPlayerControls(
+                         IconButton(
+                             onClick = actions.onToggleMute,
+                             modifier = Modifier
++                                .tvFocusRing(RoundedCornerShape(12.dp))
+                                 .size(44.dp)
+                                 .clip(RoundedCornerShape(12.dp))
+                         ) {
+@@ -300,6 +321,7 @@ fun ClassicPlayerControls(
+                             IconButton(
+                                 onClick = actions.onToggleStats,
+                                 modifier = Modifier
++                                    .tvFocusRing(RoundedCornerShape(12.dp))
+                                     .size(44.dp)
+                                     .clip(RoundedCornerShape(12.dp))
+                                     .background(if (state.isStatsVisible) AccentPurple else Color.Transparent)
+@@ -317,7 +339,9 @@ fun ClassicPlayerControls(
+                             onClick = actions.onCycleSpeed,
+                             shape = RoundedCornerShape(12.dp),
+                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+-                            modifier = Modifier.height(44.dp)
++                            modifier = Modifier
++                                .tvFocusRing(RoundedCornerShape(12.dp))
++                                .height(44.dp)
+                         ) {
+                             Icon(
+                                 imageVector = Icons.Outlined.Speed,
+@@ -352,7 +376,9 @@ fun ClassicPlayerControls(
+                             onClick = actions.onCycleAspect,
+                             shape = RoundedCornerShape(12.dp),
+                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+-                            modifier = Modifier.height(44.dp)
++                            modifier = Modifier
++                                .tvFocusRing(RoundedCornerShape(12.dp))
++                                .height(44.dp)
+                         ) {
+                             Icon(
+                                 imageVector = Icons.Outlined.AspectRatio,
+@@ -458,6 +484,7 @@ fun ModernPlayerControls(
+                                     .matchParentSize()
+                                     .clip(CircleShape)
+                                     .background(Color(0x16000000))
++                                    .tvPrimaryFocus(actions.tvPrimaryFocusRequester)
+                                     .clickable(onClick = {
+                                         if (hapticsEnabled) {
+                                             haptic.performHapticFeedback(
+@@ -558,7 +585,14 @@ private fun ModernTopPill(
+             verticalAlignment = Alignment.CenterVertically,
+             horizontalArrangement = Arrangement.SpaceBetween,
+         ) {
+-            IconButton(onClick = actions.onBack, modifier = Modifier.size(40.dp)) {
++            IconButton(
++                onClick = actions.onBack,
++                modifier = Modifier
++                    .tvFocusRing(CircleShape)
++                    // While buffering the centre play button is hidden: focus Back instead.
++                    .tvPrimaryFocus(actions.tvPrimaryFocusRequester, enabled = state.isBuffering)
++                    .size(40.dp),
++            ) {
+                 Icon(
+                     imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                     contentDescription = "Back",
+@@ -578,7 +612,12 @@ private fun ModernTopPill(
+             )
+ 
+             Box {
+-                IconButton(onClick = { moreExpanded = true }, modifier = Modifier.size(40.dp)) {
++                IconButton(
++                    onClick = { moreExpanded = true },
++                    modifier = Modifier
++                        .tvFocusRing(CircleShape)
++                        .size(40.dp),
++                ) {
+                     Icon(
+                         imageVector = Icons.Outlined.MoreVert,
+                         contentDescription = "More",
+@@ -592,6 +631,7 @@ private fun ModernTopPill(
+                 ) {
+                     if (state.canSelectSubtitles) {
+                         DropdownMenuItem(
++                            modifier = Modifier.tvFocusRing(),
+                             text = { Text("Subtitles", color = Color.White) },
+                             leadingIcon = {
+                                 Icon(Icons.Outlined.Subtitles, contentDescription = null, tint = Color.White)
+@@ -604,6 +644,7 @@ private fun ModernTopPill(
+                     }
+                     if (state.canSelectAudio) {
+                         DropdownMenuItem(
++                            modifier = Modifier.tvFocusRing(),
+                             text = { Text("Audio Tracks", color = Color.White) },
+                             leadingIcon = {
+                                 Icon(Icons.Outlined.Audiotrack, contentDescription = null, tint = Color.White)
+@@ -615,6 +656,7 @@ private fun ModernTopPill(
+                         )
+                     }
+                     DropdownMenuItem(
++                        modifier = Modifier.tvFocusRing(),
+                         text = { Text("Speed: ${state.currentSpeed}x", color = Color.White) },
+                         leadingIcon = {
+                             Icon(Icons.Outlined.Speed, contentDescription = null, tint = Color.White)
+@@ -625,6 +667,7 @@ private fun ModernTopPill(
+                         },
+                     )
+                     DropdownMenuItem(
++                        modifier = Modifier.tvFocusRing(),
+                         text = { Text("Aspect: ${resizeLabel(state.resizeMode)}", color = Color.White) },
+                         leadingIcon = {
+                             Icon(Icons.Outlined.AspectRatio, contentDescription = null, tint = Color.White)
+@@ -635,6 +678,7 @@ private fun ModernTopPill(
+                         },
+                     )
+                     DropdownMenuItem(
++                        modifier = Modifier.tvFocusRing(),
+                         text = { Text(if (state.isMuted) "Unmute" else "Mute", color = Color.White) },
+                         leadingIcon = {
+                             Icon(volumeIcon(state), contentDescription = null, tint = Color.White)
+@@ -646,6 +690,7 @@ private fun ModernTopPill(
+                     )
+                     if (state.hasInfoHash) {
+                         DropdownMenuItem(
++                            modifier = Modifier.tvFocusRing(),
+                             text = {
+                                 Text(
+                                     text = if (state.isStatsVisible) "Hide statistics" else "Show statistics",
+@@ -707,7 +752,9 @@ private fun PlayerTimeline(
+                     activeTickColor = Color.Transparent,
+                     inactiveTickColor = Color.Transparent,
+                 ),
+-                modifier = Modifier.fillMaxWidth(),
++                modifier = Modifier
++                    .tvFocusRing(RoundedCornerShape(999.dp))
++                    .fillMaxWidth(),
+             )
+         }
+ 
+@@ -806,7 +853,9 @@ private fun ModernTimeline(
+                         activeTickColor = Color.Transparent,
+                         inactiveTickColor = Color.Transparent,
+                     ),
+-                    modifier = Modifier.fillMaxWidth(),
++                    modifier = Modifier
++                        .tvFocusRing(RoundedCornerShape(999.dp))
++                        .fillMaxWidth(),
+                 )
+             }
+         }
+@@ -928,6 +977,7 @@ private fun PlayerIconButton(
+         onClick = onClick,
+         enabled = enabled,
+         modifier = Modifier
++            .tvFocusRing(RoundedCornerShape(12.dp))
+             .size(44.dp)
+             .clip(RoundedCornerShape(12.dp)),
+     ) {
+@@ -961,6 +1011,7 @@ private fun SpringGlassIconButton(
+         glassEffectsMode = glassEffectsMode,
+         cornerRadius = 999.dp,
+         modifier = Modifier
++            .tvFocusRing(CircleShape)
+             .size(size.dp)
+             .scale(scale),
+     ) {
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/tv/TvNavigationRail.kt b/app/src/main/java/com/stremio/mobile/presentation/tv/TvNavigationRail.kt
+new file mode 100644
+index 0000000..4c10c6c
+--- /dev/null
++++ b/app/src/main/java/com/stremio/mobile/presentation/tv/TvNavigationRail.kt
+@@ -0,0 +1,117 @@
++package com.stremio.mobile.presentation.tv
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.focusGroup
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxHeight
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Search
++import androidx.compose.material3.Icon
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.stremio.mobile.core.theme.AccentPurple
++import com.stremio.mobile.core.theme.MutedText
++import com.stremio.mobile.presentation.navigation.AppView
++
++/** Width reserved on the left of the board for the TV navigation rail. */
++val TvRailWidth = 96.dp
++
++/** Number of poster columns used by the Discover / Library / Search grids on TV. */
++const val TvGridColumns = 6
++
++/**
++ * Left navigation rail used on TV instead of the phone bottom bar. It is always one D-pad "left"
++ * press away from the content, which is how navigation works on Fire TV / Android TV launchers.
++ * It exposes the same destinations as [com.stremio.mobile.presentation.components.StremioBottomBar]
++ * plus a Search shortcut.
++ */
++@Composable
++fun TvNavigationRail(
++    selectedView: AppView,
++    onSelect: (AppView) -> Unit,
++    onOpenSearch: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    Column(
++        modifier = modifier
++            .fillMaxHeight()
++            .width(TvRailWidth)
++            .background(
++                Brush.horizontalGradient(
++                    colors = listOf(Color(0xF20B0A14), Color(0xCC0B0A14)),
++                ),
++            )
++            .padding(vertical = 24.dp)
++            .focusGroup(),
++        horizontalAlignment = Alignment.CenterHorizontally,
++        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically),
++    ) {
++        TvRailItem(
++            icon = Icons.Outlined.Search,
++            label = "Search",
++            selected = false,
++            onClick = onOpenSearch,
++        )
++        AppView.entries.forEach { view ->
++            TvRailItem(
++                icon = view.icon,
++                label = view.label,
++                selected = view == selectedView,
++                onClick = { onSelect(view) },
++            )
++        }
++    }
++}
++
++@Composable
++private fun TvRailItem(
++    icon: ImageVector,
++    label: String,
++    selected: Boolean,
++    onClick: () -> Unit,
++) {
++    val shape = RoundedCornerShape(18.dp)
++    val contentColor = if (selected) Color.White else MutedText
++    Column(
++        modifier = Modifier
++            .width(80.dp)
++            .clip(shape)
++            .background(if (selected) AccentPurple.copy(alpha = 0.38f) else Color.Transparent)
++            // Focus highlight comes from TvFocusIndication (LocalIndication on TV).
++            .clickable(onClick = onClick)
++            .padding(vertical = 10.dp),
++        horizontalAlignment = Alignment.CenterHorizontally,
++        verticalArrangement = Arrangement.spacedBy(4.dp),
++    ) {
++        Icon(
++            imageVector = icon,
++            contentDescription = label,
++            tint = if (selected) Color.White else contentColor,
++            modifier = Modifier.size(28.dp),
++        )
++        Text(
++            text = label,
++            color = contentColor,
++            fontSize = 12.sp,
++            fontWeight = if (selected) FontWeight.ExtraBold else FontWeight.SemiBold,
++            maxLines = 1,
++            overflow = TextOverflow.Ellipsis,
++        )
++    }
++}
+diff --git a/app/src/main/java/com/stremio/mobile/presentation/tv/TvSupport.kt b/app/src/main/java/com/stremio/mobile/presentation/tv/TvSupport.kt
+new file mode 100644
+index 0000000..a760563
+--- /dev/null
++++ b/app/src/main/java/com/stremio/mobile/presentation/tv/TvSupport.kt
+@@ -0,0 +1,271 @@
++package com.stremio.mobile.presentation.tv
++
++import android.app.Activity
++import android.app.UiModeManager
++import android.content.Context
++import android.content.ContextWrapper
++import android.content.pm.PackageManager
++import android.content.res.Configuration
++import android.os.Build
++import androidx.compose.animation.core.animateFloatAsState
++import androidx.compose.foundation.IndicationNodeFactory
++import androidx.compose.foundation.focusGroup
++import androidx.compose.foundation.interaction.FocusInteraction
++import androidx.compose.foundation.interaction.InteractionSource
++import androidx.compose.foundation.interaction.PressInteraction
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.staticCompositionLocalOf
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.composed
++import androidx.compose.ui.draw.drawWithContent
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusProperties
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.geometry.CornerRadius
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Size
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.Shape
++import androidx.compose.ui.graphics.drawOutline
++import androidx.compose.ui.graphics.drawscope.ContentDrawScope
++import androidx.compose.ui.graphics.drawscope.DrawScope
++import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.node.DelegatableNode
++import androidx.compose.ui.node.DrawModifierNode
++import androidx.compose.ui.node.invalidateDraw
++import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++
++/**
++ * Android TV / Amazon Fire TV support.
++ *
++ * Everything in this file is a no-op on phones and tablets: the TV behaviour is switched on only
++ * when [TvDevice.isTv] detects a leanback / Fire TV / non-touch device, so the original mobile
++ * experience is left untouched.
++ */
++object TvDevice {
++    /** Extra font scaling applied on TV for 10-foot readability (see MainActivity.attachBaseContext). */
++    const val TV_FONT_SCALE = 1.15f
++
++    @Volatile
++    private var cached: Boolean? = null
++
++    fun isTv(context: Context): Boolean {
++        cached?.let { return it }
++        val appContext = context.applicationContext ?: context
++        val pm = appContext.packageManager
++        val uiModeManager = appContext.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
++        val result = uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
++            pm.hasSystemFeature(AMAZON_FIRE_TV_FEATURE) ||
++            pm.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
++            Build.MODEL.orEmpty().startsWith("AFT") ||
++            !pm.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
++        cached = result
++        return result
++    }
++
++    private const val AMAZON_FIRE_TV_FEATURE = "amazon.hardware.fire_tv"
++}
++
++/** True when the app runs on a TV (Fire TV Stick, Android TV, Google TV). */
++val LocalIsTvDevice = staticCompositionLocalOf { false }
++
++object TvFocusDefaults {
++    val RingColor = Color.White
++    val RingShadowColor = Color.Black.copy(alpha = 0.55f)
++    val FocusedOverlay = Color.White.copy(alpha = 0.16f)
++    val PressedOverlay = Color.White.copy(alpha = 0.22f)
++    val RingWidth = 3.dp
++    val Shape: Shape = RoundedCornerShape(14.dp)
++}
++
++/**
++ * Indication used by every `Modifier.clickable` / `selectable` / `toggleable` on TV (provided
++ * through `LocalIndication`). It draws a bright overlay plus a thick white ring around the
++ * focused element so the D-pad position is obvious from the sofa.
++ */
++object TvFocusIndication : IndicationNodeFactory {
++    override fun create(interactionSource: InteractionSource): DelegatableNode =
++        TvFocusIndicationNode(interactionSource)
++
++    override fun equals(other: Any?): Boolean = other === this
++
++    override fun hashCode(): Int = javaClass.hashCode()
++}
++
++private class TvFocusIndicationNode(
++    private val interactionSource: InteractionSource,
++) : Modifier.Node(), DrawModifierNode {
++    private var focused = false
++    private var pressed = false
++
++    override fun onAttach() {
++        coroutineScope.launch {
++            var focusCount = 0
++            var pressCount = 0
++            interactionSource.interactions.collect { interaction ->
++                when (interaction) {
++                    is FocusInteraction.Focus -> focusCount++
++                    is FocusInteraction.Unfocus -> focusCount = (focusCount - 1).coerceAtLeast(0)
++                    is PressInteraction.Press -> pressCount++
++                    is PressInteraction.Release -> pressCount = (pressCount - 1).coerceAtLeast(0)
++                    is PressInteraction.Cancel -> pressCount = (pressCount - 1).coerceAtLeast(0)
++                }
++                val newFocused = focusCount > 0
++                val newPressed = pressCount > 0
++                if (newFocused != focused || newPressed != pressed) {
++                    focused = newFocused
++                    pressed = newPressed
++                    invalidateDraw()
++                }
++            }
++        }
++    }
++
++    override fun ContentDrawScope.draw() {
++        drawContent()
++        if (pressed) {
++            drawRect(TvFocusDefaults.PressedOverlay)
++        }
++        if (focused) {
++            drawRect(TvFocusDefaults.FocusedOverlay)
++            drawFocusRingInBounds()
++        }
++    }
++}
++
++/**
++ * Draws the focus ring inside the bounds. The corner radius is chosen generously (a larger radius
++ * always stays inside a less-rounded clip) so the ring is never cut by the element's own clip.
++ */
++private fun DrawScope.drawFocusRingInBounds() {
++    val ring = TvFocusDefaults.RingWidth.toPx()
++    val radius = if (size.height <= 64.dp.toPx()) {
++        size.minDimension / 2f
++    } else {
++        minOf(size.minDimension / 2f, 22.dp.toPx())
++    }
++    // Dark halo first so the white ring stays visible on light surfaces too.
++    drawRoundRect(
++        color = TvFocusDefaults.RingShadowColor,
++        topLeft = Offset(ring, ring),
++        size = Size(size.width - ring * 2f, size.height - ring * 2f),
++        cornerRadius = CornerRadius((radius - ring).coerceAtLeast(0f)),
++        style = Stroke(width = ring),
++    )
++    drawRoundRect(
++        color = TvFocusDefaults.RingColor,
++        topLeft = Offset(ring / 2f, ring / 2f),
++        size = Size(size.width - ring, size.height - ring),
++        cornerRadius = CornerRadius(radius),
++        style = Stroke(width = ring),
++    )
++}
++
++/**
++ * Focus ring for components that do not use `LocalIndication` (Material3 Button, IconButton,
++ * Switch, Slider, FilterChip, DropdownMenuItem… and clickables declared with `indication = null`).
++ * Apply it as the OUTERMOST modifier of the component: it observes the focus state of the focus
++ * target below it and draws a ring following [shape], optionally scaling the element up.
++ */
++fun Modifier.tvFocusRing(
++    shape: Shape = TvFocusDefaults.Shape,
++    focusedScale: Float = 1f,
++): Modifier = composed {
++    if (!LocalIsTvDevice.current) return@composed Modifier
++    var focused by remember { mutableStateOf(false) }
++    val scale by animateFloatAsState(
++        targetValue = if (focused) focusedScale else 1f,
++        label = "tvFocusScale",
++    )
++    Modifier
++        .onFocusChanged { focused = it.hasFocus }
++        .then(
++            if (focusedScale != 1f) {
++                Modifier.graphicsLayer {
++                    scaleX = scale
++                    scaleY = scale
++                }
++            } else {
++                Modifier
++            },
++        )
++        .drawWithContent {
++            drawContent()
++            if (focused) {
++                val ring = TvFocusDefaults.RingWidth.toPx()
++                val outline = shape.createOutline(size, layoutDirection, this)
++                drawOutline(outline, color = TvFocusDefaults.RingShadowColor, style = Stroke(width = ring * 2.2f))
++                drawOutline(outline, color = TvFocusDefaults.RingColor, style = Stroke(width = ring))
++            }
++        }
++}
++
++/** Scales an element up while it (or one of its children) has D-pad focus. TV only. */
++fun Modifier.tvFocusScale(focusedScale: Float = 1.08f): Modifier = composed {
++    if (!LocalIsTvDevice.current) return@composed Modifier
++    var focused by remember { mutableStateOf(false) }
++    val scale by animateFloatAsState(
++        targetValue = if (focused) focusedScale else 1f,
++        label = "tvFocusScale",
++    )
++    Modifier
++        .onFocusChanged { focused = it.hasFocus }
++        .graphicsLayer {
++            scaleX = scale
++            scaleY = scale
++        }
++}
++
++/**
++ * Turns an overlay (sheet, full-screen panel) into a focus trap on TV:
++ *  - when [active] becomes true, D-pad focus is moved inside the overlay (first focusable child);
++ *  - while [active], arrow keys can never move focus to the screen drawn underneath.
++ *
++ * [active] must be true only for the top-most overlay: a programmatic `requestFocus()` on another
++ * overlay also runs `onExit`, so an inactive trap must let focus go.
++ */
++fun Modifier.tvFocusTrap(active: Boolean = true): Modifier = composed {
++    if (!LocalIsTvDevice.current) return@composed Modifier
++    val requester = remember { FocusRequester() }
++    val currentActive by rememberUpdatedState(active)
++    var hasFocus by remember { mutableStateOf(false) }
++
++    LaunchedEffect(active) {
++        if (!active) return@LaunchedEffect
++        // Content may need a few frames to be laid out (lazy lists, async data): retry briefly.
++        repeat(20) {
++            if (hasFocus) return@LaunchedEffect
++            runCatching { requester.requestFocus() }
++            delay(50)
++        }
++    }
++
++    Modifier
++        .focusRequester(requester)
++        .onFocusChanged { hasFocus = it.hasFocus }
++        .focusProperties {
++            onExit = {
++                if (currentActive) cancelFocusChange()
++            }
++        }
++        .focusGroup()
++}
++
++/** Makes a clickable (e.g. a scrim or a click-blocking container) unreachable by the D-pad. */
++fun Modifier.notFocusable(): Modifier = focusProperties { canFocus = false }
++
++tailrec fun Context.findActivityOrNull(): Activity? = when (this) {
++    is Activity -> this
++    is ContextWrapper -> baseContext.findActivityOrNull()
++    else -> null
++}
+diff --git a/app/src/main/java/com/stremio/mobile/update/UpdateRepository.kt b/app/src/main/java/com/stremio/mobile/update/UpdateRepository.kt
+index e89202c..20d683d 100644
+--- a/app/src/main/java/com/stremio/mobile/update/UpdateRepository.kt
++++ b/app/src/main/java/com/stremio/mobile/update/UpdateRepository.kt
+@@ -227,7 +227,9 @@ class UpdateRepository(private val context: Context) {
+     )
+ 
+     companion object {
+-        private const val LATEST_RELEASE_URL = "https://api.github.com/repos/perpetus/stremio-android/releases/latest"
++        // Configurable so that forks (e.g. the Fire TV build) check their own GitHub releases.
++        // Override with -PUPDATE_REPOSITORY=owner/repo; defaults to the upstream repository.
++        private val LATEST_RELEASE_URL = "https://api.github.com/repos/${BuildConfig.UPDATE_REPOSITORY}/releases/latest"
+         private val SEMVER_REGEX = Regex("""\d+\.\d+\.\d+""")
+     }
+ }
+diff --git a/app/src/main/res/drawable/tv_banner.xml b/app/src/main/res/drawable/tv_banner.xml
+new file mode 100644
+index 0000000..5fc3a7c
+--- /dev/null
++++ b/app/src/main/res/drawable/tv_banner.xml
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Leanback / Fire TV launcher banner: 160x90dp (320x180px on xhdpi TVs). -->
++<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
++    <item>
++        <shape android:shape="rectangle">
++            <size
++                android:width="160dp"
++                android:height="90dp" />
++            <gradient
++                android:angle="0"
++                android:endColor="#2A1F5C"
++                android:startColor="#100F1F"
++                android:type="linear" />
++        </shape>
++    </item>
++    <item
++        android:width="108dp"
++        android:height="108dp"
++        android:drawable="@drawable/ic_launcher_foreground"
++        android:gravity="center" />
++</layer-list>
